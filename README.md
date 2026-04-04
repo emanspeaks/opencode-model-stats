@@ -2,6 +2,8 @@
 
 Shows live and average tokens-per-second in the OpenCode session prompt.
 
+Requires `opencode` `1.3.14` or newer.
+
 ## Installation
 
 Install from the CLI:
