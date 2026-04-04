@@ -13,6 +13,7 @@ const SINGLE_SAMPLE_MS = 1_000
 type MessageTiming = {
   sessionID: string
   requestStartAt: number
+  firstResponseAt?: number
   firstTokenAt?: number
   lastTokenAt?: number
   lastToolCallAt?: number
@@ -157,7 +158,12 @@ const tui: TuiPlugin = async (api) => {
     if (timing) {
       tracker.messageTimingByID[messageID] = timing.firstTokenAt
         ? { ...timing, lastTokenAt: now }
-        : { ...timing, firstTokenAt: now, lastTokenAt: now }
+        : {
+            ...timing,
+            firstResponseAt: timing.firstResponseAt ?? now,
+            firstTokenAt: now,
+            lastTokenAt: now,
+          }
     }
     bump()
   }
@@ -182,6 +188,7 @@ const tui: TuiPlugin = async (api) => {
       tracker.messageTimingByID[evt.properties.info.id] = {
         sessionID: evt.properties.sessionID,
         requestStartAt: evt.properties.info.time.created,
+        firstResponseAt: existing?.firstResponseAt,
         firstTokenAt: existing?.firstTokenAt,
         lastTokenAt: existing?.lastTokenAt,
         lastToolCallAt: existing?.lastToolCallAt,
@@ -191,14 +198,14 @@ const tui: TuiPlugin = async (api) => {
     }
 
     const timing = tracker.messageTimingByID[evt.properties.info.id]
-    if (timing?.sessionID === evt.properties.sessionID && typeof timing.firstTokenAt === "number") {
+    if (timing?.sessionID === evt.properties.sessionID && typeof timing.firstResponseAt === "number") {
       const totalTokens = evt.properties.info.tokens.output + evt.properties.info.tokens.reasoning
       const endAt =
         evt.properties.info.finish === "tool-calls"
           ? timing.lastToolCallAt
           : evt.properties.info.time.completed
-      const durationMs = typeof endAt === "number" ? Math.max(endAt - timing.firstTokenAt, 1) : undefined
-      const ttftMs = Math.max(timing.firstTokenAt - timing.requestStartAt, 0)
+      const durationMs = typeof endAt === "number" ? Math.max(endAt - timing.firstResponseAt, 1) : undefined
+      const ttftMs = Math.max(timing.firstResponseAt - timing.requestStartAt, 0)
       if (totalTokens > 0 && durationMs) {
         const totals = tracker.sessionAverageByID[evt.properties.sessionID] ?? {
           totalTokens: 0,
@@ -228,9 +235,17 @@ const tui: TuiPlugin = async (api) => {
     ) {
       clearLiveSamples(evt.properties.sessionID)
     }
-    if (evt.properties.part.state.status !== "running") return
     const timing = tracker.messageTimingByID[evt.properties.part.messageID]
     if (!timing) return
+    if (evt.properties.part.state.status === "pending") {
+      tracker.messageTimingByID[evt.properties.part.messageID] = {
+        ...timing,
+        firstResponseAt: timing.firstResponseAt ?? evt.properties.time,
+      }
+      bump()
+      return
+    }
+    if (evt.properties.part.state.status !== "running") return
     tracker.messageTimingByID[evt.properties.part.messageID] = {
       ...timing,
       lastToolCallAt: evt.properties.part.state.time.start,
