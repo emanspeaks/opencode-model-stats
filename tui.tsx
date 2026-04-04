@@ -12,13 +12,16 @@ const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
 type MessageTiming = {
   sessionID: string
-  firstTokenAt: number
-  lastTokenAt: number
+  requestStartAt: number
+  firstTokenAt?: number
+  lastTokenAt?: number
 }
 
 type SessionAverage = {
   totalTokens: number
   totalDurationMs: number
+  totalTtftMs: number
+  messageCount: number
 }
 
 type TrackerState = {
@@ -31,17 +34,16 @@ function estimateStreamTokens(delta: string) {
   return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 5))
 }
 
-function formatTps(value: number) {
+function formatRate(value: number, label: "TPS" | "AVG") {
   if (!Number.isFinite(value) || value <= 0) return undefined
-  if (value >= 100) return `${Math.round(value)} TPS`
-  if (value >= 10) return `${value.toFixed(1)} TPS`
-  return `${value.toFixed(2)} TPS`
+  if (value >= 100) return `${Math.round(value)}${label === "TPS" ? " TPS" : ""}`
+  if (value >= 10) return `${value.toFixed(1)}${label === "TPS" ? " TPS" : ""}`
+  return `${value.toFixed(2)}${label === "TPS" ? " TPS" : ""}`
 }
 
-function formatSessionAverage(value: number) {
-  const formatted = formatTps(value)
-  if (!formatted) return undefined
-  return formatted.replace(/ TPS$/, "")
+function formatTtft(value: number) {
+  if (!Number.isFinite(value) || value < 0) return undefined
+  return `${value.toFixed(1)}s`
 }
 
 function activeDurationMs(samples: StreamSample[], tailAt?: number) {
@@ -74,7 +76,14 @@ function SessionPromptRight(props: {
     props.version()
     const totals = props.tracker.sessionAverageByID[props.sessionID]
     if (!totals || totals.totalTokens <= 0 || totals.totalDurationMs <= 0) return undefined
-    return formatSessionAverage(totals.totalTokens / (totals.totalDurationMs / 1000))
+    return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000), "AVG")
+  })
+
+  const sessionTtft = createMemo(() => {
+    props.version()
+    const totals = props.tracker.sessionAverageByID[props.sessionID]
+    if (!totals || totals.messageCount <= 0 || totals.totalTtftMs < 0) return undefined
+    return formatTtft(totals.totalTtftMs / totals.messageCount / 1000)
   })
 
   const liveTps = createMemo(() => {
@@ -92,13 +101,14 @@ function SessionPromptRight(props: {
     const total = relevant.reduce((sum, sample) => sum + sample.tokens, 0)
     const durationSeconds = activeDurationMs(relevant, now) / 1000
     if (durationSeconds <= 0) return undefined
-    return formatTps(total / durationSeconds)
+    return formatRate(total / durationSeconds, "AVG")
   })
 
   const text = createMemo(() => {
-    const live = liveTps() ? `~${liveTps()}` : "- TPS"
+    const live = liveTps() ?? "-"
     const avg = sessionAverage() ?? "-"
-    return `${live} | AVG ${avg}`
+    const ttft = sessionTtft() ?? "-"
+    return `TPS ${live} | AVG ${avg} | TTFT ${ttft}`
   })
 
   return <>{text() ? <text fg={props.api.theme.current.textMuted}>{text()}</text> : null}</>
@@ -143,9 +153,11 @@ const tui: TuiPlugin = async (api) => {
       sample,
     ]
     const timing = tracker.messageTimingByID[messageID]
-    tracker.messageTimingByID[messageID] = timing
-      ? { ...timing, lastTokenAt: now }
-      : { sessionID, firstTokenAt: now, lastTokenAt: now }
+    if (timing) {
+      tracker.messageTimingByID[messageID] = timing.firstTokenAt
+        ? { ...timing, lastTokenAt: now }
+        : { ...timing, firstTokenAt: now, lastTokenAt: now }
+    }
     bump()
   }
 
@@ -163,19 +175,40 @@ const tui: TuiPlugin = async (api) => {
 
   const onMessage = api.event.on("message.updated", (evt) => {
     if (evt.properties.info.role !== "assistant") return
-    if (!evt.properties.info.time.completed) return
+
+    if (!evt.properties.info.time.completed) {
+      const existing = tracker.messageTimingByID[evt.properties.info.id]
+      tracker.messageTimingByID[evt.properties.info.id] = {
+        sessionID: evt.properties.sessionID,
+        requestStartAt: evt.properties.info.time.created,
+        firstTokenAt: existing?.firstTokenAt,
+        lastTokenAt: existing?.lastTokenAt,
+      }
+      bump()
+      return
+    }
+
     const timing = tracker.messageTimingByID[evt.properties.info.id]
-    if (timing?.sessionID === evt.properties.sessionID) {
+    if (
+      timing?.sessionID === evt.properties.sessionID &&
+      typeof timing.firstTokenAt === "number" &&
+      typeof timing.lastTokenAt === "number"
+    ) {
       const totalTokens = evt.properties.info.tokens.output + evt.properties.info.tokens.reasoning
       const durationMs = Math.max(timing.lastTokenAt - timing.firstTokenAt, 1)
+      const ttftMs = Math.max(timing.firstTokenAt - timing.requestStartAt, 0)
       if (totalTokens > 0) {
         const totals = tracker.sessionAverageByID[evt.properties.sessionID] ?? {
           totalTokens: 0,
           totalDurationMs: 0,
+          totalTtftMs: 0,
+          messageCount: 0,
         }
         tracker.sessionAverageByID[evt.properties.sessionID] = {
           totalTokens: totals.totalTokens + totalTokens,
           totalDurationMs: totals.totalDurationMs + durationMs,
+          totalTtftMs: totals.totalTtftMs + ttftMs,
+          messageCount: totals.messageCount + 1,
         }
       }
     }
