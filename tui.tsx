@@ -17,10 +17,11 @@ const MAX_MESSAGE_SAMPLES = 4_096
 type TrackerState = {
   streamSamplesBySession: Record<string, StreamSample[]>
   messageSamples: Record<string, StreamSample[]>
+  finalTpsByMessage: Record<string, string>
 }
 
 function estimateStreamTokens(delta: string) {
-  return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 4))
+  return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 5))
 }
 
 function formatTps(value: number) {
@@ -49,6 +50,13 @@ function activeDurationMs(samples: StreamSample[], tailAt?: number) {
   return Math.max(duration, SINGLE_SAMPLE_MS)
 }
 
+function computeFinalTps(message: AssistantMessage, samples: StreamSample[]) {
+  const end = message.time.completed ?? message.time.created
+  const durationSeconds = activeDurationMs(samples, end) / 1000
+  if (durationSeconds <= 0) return undefined
+  return formatTps((message.tokens.output + message.tokens.reasoning) / durationSeconds)
+}
+
 function SessionPromptRight(props: {
   api: Parameters<TuiPlugin>[0]
   sessionID: string
@@ -61,19 +69,11 @@ function SessionPromptRight(props: {
   const finalTps = createMemo(() => {
     props.version()
     const last = sessionMessages().findLast(
-      (item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0,
+      (item): item is AssistantMessage =>
+        item.role === "assistant" && item.tokens.output + item.tokens.reasoning > 0,
     )
     if (!last) return undefined
-
-    const user = sessionMessages().find((item) => item.role === "user" && item.id === last.parentID)
-    const start = user?.time.created ?? last.time.created
-    const end = last.time.completed ?? last.time.created
-    const sampleWindow = props.tracker.messageSamples[last.id] ?? []
-    const activeMs = activeDurationMs(sampleWindow)
-    const wallMs = end > start ? end - start : 0
-    const durationSeconds = (activeMs > 0 ? activeMs : wallMs) / 1000
-    if (durationSeconds <= 0) return undefined
-    return formatTps(last.tokens.output / durationSeconds)
+    return props.tracker.finalTpsByMessage[last.id]
   })
 
   const liveTps = createMemo(() => {
@@ -107,6 +107,7 @@ const tui: TuiPlugin = async (api) => {
   const tracker: TrackerState = {
     streamSamplesBySession: {},
     messageSamples: {},
+    finalTpsByMessage: {},
   }
   const [version, setVersion] = createSignal(0)
   const [clock, setClock] = createSignal(Date.now())
@@ -153,6 +154,9 @@ const tui: TuiPlugin = async (api) => {
   const onMessage = api.event.on("message.updated", (evt) => {
     if (evt.properties.info.role !== "assistant") return
     if (!evt.properties.info.time.completed) return
+    const finalTps = computeFinalTps(evt.properties.info, tracker.messageSamples[evt.properties.info.id] ?? [])
+    if (finalTps) tracker.finalTpsByMessage[evt.properties.info.id] = finalTps
+    delete tracker.messageSamples[evt.properties.info.id]
     pruneSamples(evt.properties.info.time.completed)
     bump()
   })
