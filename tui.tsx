@@ -15,6 +15,7 @@ type MessageTiming = {
   requestStartAt: number
   firstTokenAt?: number
   lastTokenAt?: number
+  lastToolCallAt?: number
 }
 
 type SessionAverage = {
@@ -183,21 +184,22 @@ const tui: TuiPlugin = async (api) => {
         requestStartAt: evt.properties.info.time.created,
         firstTokenAt: existing?.firstTokenAt,
         lastTokenAt: existing?.lastTokenAt,
+        lastToolCallAt: existing?.lastToolCallAt,
       }
       bump()
       return
     }
 
     const timing = tracker.messageTimingByID[evt.properties.info.id]
-    if (
-      timing?.sessionID === evt.properties.sessionID &&
-      typeof timing.firstTokenAt === "number" &&
-      typeof timing.lastTokenAt === "number"
-    ) {
+    if (timing?.sessionID === evt.properties.sessionID && typeof timing.firstTokenAt === "number") {
       const totalTokens = evt.properties.info.tokens.output + evt.properties.info.tokens.reasoning
-      const durationMs = Math.max(timing.lastTokenAt - timing.firstTokenAt, 1)
+      const endAt =
+        evt.properties.info.finish === "tool-calls"
+          ? timing.lastToolCallAt
+          : evt.properties.info.time.completed
+      const durationMs = typeof endAt === "number" ? Math.max(endAt - timing.firstTokenAt, 1) : undefined
       const ttftMs = Math.max(timing.firstTokenAt - timing.requestStartAt, 0)
-      if (totalTokens > 0) {
+      if (totalTokens > 0 && durationMs) {
         const totals = tracker.sessionAverageByID[evt.properties.sessionID] ?? {
           totalTokens: 0,
           totalDurationMs: 0,
@@ -226,6 +228,14 @@ const tui: TuiPlugin = async (api) => {
     ) {
       clearLiveSamples(evt.properties.sessionID)
     }
+    if (evt.properties.part.state.status !== "running") return
+    const timing = tracker.messageTimingByID[evt.properties.part.messageID]
+    if (!timing) return
+    tracker.messageTimingByID[evt.properties.part.messageID] = {
+      ...timing,
+      lastToolCallAt: evt.properties.part.state.time.start,
+    }
+    bump()
   })
 
   const timer = setInterval(() => {
