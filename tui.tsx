@@ -1,6 +1,5 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import { createMemo, createSignal } from "solid-js"
 
 type StreamSample = {
@@ -8,16 +7,24 @@ type StreamSample = {
   tokens: number
 }
 
-const STREAM_WINDOW_MS = 15_000
-const ACTIVE_GAP_MS = 1_250
+const STREAM_WINDOW_MS = 5_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
-const MAX_MESSAGE_SAMPLES = 4_096
+type MessageTiming = {
+  sessionID: string
+  firstTokenAt: number
+  lastTokenAt: number
+}
+
+type SessionAverage = {
+  totalTokens: number
+  totalDurationMs: number
+}
 
 type TrackerState = {
   streamSamplesBySession: Record<string, StreamSample[]>
-  messageSamples: Record<string, StreamSample[]>
-  finalTpsByMessage: Record<string, string>
+  messageTimingByID: Record<string, MessageTiming>
+  sessionAverageByID: Record<string, SessionAverage>
 }
 
 function estimateStreamTokens(delta: string) {
@@ -31,6 +38,12 @@ function formatTps(value: number) {
   return `${value.toFixed(2)} TPS`
 }
 
+function formatSessionAverage(value: number) {
+  const formatted = formatTps(value)
+  if (!formatted) return undefined
+  return formatted.replace(/ TPS$/, "")
+}
+
 function activeDurationMs(samples: StreamSample[], tailAt?: number) {
   if (samples.length === 0) return 0
   if (samples.length === 1) {
@@ -40,21 +53,14 @@ function activeDurationMs(samples: StreamSample[], tailAt?: number) {
 
   let duration = 0
   for (let i = 1; i < samples.length; i++) {
-    duration += Math.min(Math.max(0, samples[i].at - samples[i - 1].at), ACTIVE_GAP_MS)
+    duration += Math.max(0, samples[i].at - samples[i - 1].at)
   }
 
   if (tailAt) {
-    duration += Math.min(Math.max(0, tailAt - samples[samples.length - 1].at), ACTIVE_GAP_MS)
+    duration += Math.max(0, tailAt - samples[samples.length - 1].at)
   }
 
   return Math.max(duration, SINGLE_SAMPLE_MS)
-}
-
-function computeFinalTps(message: AssistantMessage, samples: StreamSample[]) {
-  const end = message.time.completed ?? message.time.created
-  const durationSeconds = activeDurationMs(samples, end) / 1000
-  if (durationSeconds <= 0) return undefined
-  return formatTps((message.tokens.output + message.tokens.reasoning) / durationSeconds)
 }
 
 function SessionPromptRight(props: {
@@ -64,16 +70,11 @@ function SessionPromptRight(props: {
   version: () => number
   clock: () => number
 }) {
-  const sessionMessages = createMemo(() => props.api.state.session.messages(props.sessionID))
-
-  const finalTps = createMemo(() => {
+  const sessionAverage = createMemo(() => {
     props.version()
-    const last = sessionMessages().findLast(
-      (item): item is AssistantMessage =>
-        item.role === "assistant" && item.tokens.output + item.tokens.reasoning > 0,
-    )
-    if (!last) return undefined
-    return props.tracker.finalTpsByMessage[last.id]
+    const totals = props.tracker.sessionAverageByID[props.sessionID]
+    if (!totals || totals.totalTokens <= 0 || totals.totalDurationMs <= 0) return undefined
+    return formatSessionAverage(totals.totalTokens / (totals.totalDurationMs / 1000))
   })
 
   const liveTps = createMemo(() => {
@@ -95,9 +96,9 @@ function SessionPromptRight(props: {
   })
 
   const text = createMemo(() => {
-    const live = liveTps()
-    if (live) return `~${live}`
-    return finalTps()
+    const live = liveTps() ? `~${liveTps()}` : "- TPS"
+    const avg = sessionAverage() ?? "-"
+    return `${live} | AVG ${avg}`
   })
 
   return <>{text() ? <text fg={props.api.theme.current.textMuted}>{text()}</text> : null}</>
@@ -106,8 +107,8 @@ function SessionPromptRight(props: {
 const tui: TuiPlugin = async (api) => {
   const tracker: TrackerState = {
     streamSamplesBySession: {},
-    messageSamples: {},
-    finalTpsByMessage: {},
+    messageTimingByID: {},
+    sessionAverageByID: {},
   }
   const [version, setVersion] = createSignal(0)
   const [clock, setClock] = createSignal(Date.now())
@@ -129,13 +130,22 @@ const tui: TuiPlugin = async (api) => {
     if (changed) bump()
   }
 
+  const clearLiveSamples = (sessionID: string) => {
+    if (!tracker.streamSamplesBySession[sessionID]?.length) return
+    delete tracker.streamSamplesBySession[sessionID]
+    bump()
+  }
+
   const appendSample = (sessionID: string, messageID: string, sample: StreamSample) => {
     const now = sample.at
     tracker.streamSamplesBySession[sessionID] = [
       ...(tracker.streamSamplesBySession[sessionID] ?? []).filter((item) => now - item.at <= STREAM_WINDOW_MS),
       sample,
     ]
-    tracker.messageSamples[messageID] = [...(tracker.messageSamples[messageID] ?? []), sample].slice(-MAX_MESSAGE_SAMPLES)
+    const timing = tracker.messageTimingByID[messageID]
+    tracker.messageTimingByID[messageID] = timing
+      ? { ...timing, lastTokenAt: now }
+      : { sessionID, firstTokenAt: now, lastTokenAt: now }
     bump()
   }
 
@@ -154,11 +164,35 @@ const tui: TuiPlugin = async (api) => {
   const onMessage = api.event.on("message.updated", (evt) => {
     if (evt.properties.info.role !== "assistant") return
     if (!evt.properties.info.time.completed) return
-    const finalTps = computeFinalTps(evt.properties.info, tracker.messageSamples[evt.properties.info.id] ?? [])
-    if (finalTps) tracker.finalTpsByMessage[evt.properties.info.id] = finalTps
-    delete tracker.messageSamples[evt.properties.info.id]
+    const timing = tracker.messageTimingByID[evt.properties.info.id]
+    if (timing?.sessionID === evt.properties.sessionID) {
+      const totalTokens = evt.properties.info.tokens.output + evt.properties.info.tokens.reasoning
+      const durationMs = Math.max(timing.lastTokenAt - timing.firstTokenAt, 1)
+      if (totalTokens > 0) {
+        const totals = tracker.sessionAverageByID[evt.properties.sessionID] ?? {
+          totalTokens: 0,
+          totalDurationMs: 0,
+        }
+        tracker.sessionAverageByID[evt.properties.sessionID] = {
+          totalTokens: totals.totalTokens + totalTokens,
+          totalDurationMs: totals.totalDurationMs + durationMs,
+        }
+      }
+    }
+    delete tracker.messageTimingByID[evt.properties.info.id]
     pruneSamples(evt.properties.info.time.completed)
     bump()
+  })
+
+  const onPart = api.event.on("message.part.updated", (evt) => {
+    if (evt.properties.part.type !== "tool") return
+    if (
+      evt.properties.part.state.status === "running" ||
+      evt.properties.part.state.status === "completed" ||
+      evt.properties.part.state.status === "error"
+    ) {
+      clearLiveSamples(evt.properties.sessionID)
+    }
   })
 
   const timer = setInterval(() => {
@@ -169,6 +203,7 @@ const tui: TuiPlugin = async (api) => {
   api.lifecycle.onDispose(() => {
     onDelta()
     onMessage()
+    onPart()
     clearInterval(timer)
   })
 
