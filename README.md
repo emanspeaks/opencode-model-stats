@@ -1,6 +1,6 @@
 # oc-tps
 
-Displays live TPS, average TPS, and TTFT in the OpenCode session prompt. TTFT, or time to first token, measures how long it takes the model to begin responding.
+Displays live TPS (tokens per second), average TPS, and average TTFT (time to first token) in the OpenCode session prompt.
 
 
 ![Demo](./assets/demo.gif)
