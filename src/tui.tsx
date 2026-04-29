@@ -355,7 +355,7 @@ const tui: TuiPlugin = async (api, options) => {
       loggedPrefillPollFailure = false
     } catch {
       if (!loggedPrefillPollFailure) {
-        console.warn("oc-tps: prefill progress polling failed; using elapsed prefill fallback.")
+        console.warn("opencode-model-stats: prefill progress polling failed; using elapsed prefill fallback.")
         loggedPrefillPollFailure = true
       }
     } finally {
@@ -516,7 +516,7 @@ const tui: TuiPlugin = async (api, options) => {
 }
 
 const plugin: TuiPluginModule & { id: string } = {
-  id: "oc-tps",
+  id: "opencode-model-stats",
   tui,
 }
 
