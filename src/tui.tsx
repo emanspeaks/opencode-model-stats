@@ -10,10 +10,8 @@ type StreamSample = {
 const STREAM_WINDOW_MS = 5_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
-const PREFILL_PROGRESS_URL = process.env.LLAMA_PREFILL_PROGRESS_URL ?? "http://127.0.0.1:8080/prefill-progress"
-const PREFILL_POLL_MS = Number.isFinite(Number(process.env.LLAMA_PREFILL_POLL_MS ?? "250"))
-  ? Math.max(100, Number(process.env.LLAMA_PREFILL_POLL_MS ?? "250"))
-  : 250
+const DEFAULT_PREFILL_PROGRESS_URL = "http://127.0.0.1:8080"
+const DEFAULT_PREFILL_POLL_MS = 250
 
 type PrefillProgress = {
   sessionID: string
@@ -213,7 +211,14 @@ function SessionPromptRight(props: {
   return <>{text() ? <text fg={props.api.theme.current.textMuted}>{text()}</text> : null}</>
 }
 
-const tui: TuiPlugin = async (api) => {
+const tui: TuiPlugin = async (api, options) => {
+  const prefillProgressUrl = (typeof options?.prefillProgressUrl === "string"
+    ? options.prefillProgressUrl
+    : DEFAULT_PREFILL_PROGRESS_URL) + "/prefill-progress"
+  const prefillPollMs = (() => {
+    const n = Number(options?.prefillPollMs)
+    return Number.isFinite(n) && n > 0 ? Math.max(100, n) : DEFAULT_PREFILL_POLL_MS
+  })()
   const tracker: TrackerState = {
     streamSamplesBySession: {},
     messageTimingByID: {},
@@ -284,6 +289,23 @@ const tui: TuiPlugin = async (api) => {
     return result
   }
 
+  const getPrefillUrlForSession = (sessionID: string): string => {
+    const messages = api.state.session.messages(sessionID)
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i]
+      if (msg.role !== "user") continue
+      const provider = api.state.provider.find((p) => p.id === msg.model.providerID)
+      const model = provider?.models[msg.model.modelID]
+      if (model?.api.url) {
+        try {
+          return new URL("/prefill-progress", model.api.url).toString()
+        } catch {}
+      }
+      break
+    }
+    return prefillProgressUrl
+  }
+
   const pollPrefillProgress = async () => {
     if (prefillPollInFlight) return
     prefillPollInFlight = true
@@ -304,7 +326,7 @@ const tui: TuiPlugin = async (api) => {
           continue
         }
 
-        const url = new URL(PREFILL_PROGRESS_URL)
+        const url = new URL(getPrefillUrlForSession(sessionID))
         url.searchParams.set("session_id", sessionID)
         url.searchParams.set("message_id", current.messageID)
 
@@ -475,7 +497,7 @@ const tui: TuiPlugin = async (api) => {
     pruneSamples()
     prunePrefill()
     void pollPrefillProgress()
-  }, PREFILL_POLL_MS)
+  }, prefillPollMs)
 
   api.lifecycle.onDispose(() => {
     onDelta()
