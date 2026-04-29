@@ -10,6 +10,20 @@ type StreamSample = {
 const STREAM_WINDOW_MS = 5_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
+const PREFILL_PROGRESS_URL = process.env.LLAMA_PREFILL_PROGRESS_URL ?? "http://127.0.0.1:8080/prefill-progress"
+const PREFILL_POLL_MS = Number.isFinite(Number(process.env.LLAMA_PREFILL_POLL_MS ?? "250"))
+  ? Math.max(100, Number(process.env.LLAMA_PREFILL_POLL_MS ?? "250"))
+  : 250
+
+type PrefillProgress = {
+  sessionID: string
+  total: number
+  cache: number
+  processed: number
+  timeMs: number
+  receivedAt: number
+}
+
 type MessageTiming = {
   sessionID: string
   requestStartAt: number
@@ -30,6 +44,16 @@ type TrackerState = {
   streamSamplesBySession: Record<string, StreamSample[]>
   messageTimingByID: Record<string, MessageTiming>
   sessionAverageByID: Record<string, SessionAverage>
+  prefillBySession: Record<string, PrefillProgress>
+}
+
+type ProxyPrefillPayload = {
+  found?: unknown
+  total?: unknown
+  cache?: unknown
+  processed?: unknown
+  time_ms?: unknown
+  done?: unknown
 }
 
 function estimateStreamTokens(delta: string) {
@@ -65,6 +89,63 @@ function activeDurationMs(samples: StreamSample[], tailAt?: number) {
   }
 
   return Math.max(duration, SINGLE_SAMPLE_MS)
+}
+
+function findActiveTimingForSession(messageTimingByID: Record<string, MessageTiming>, sessionID: string): MessageTiming | undefined {
+  let best: MessageTiming | undefined
+
+  for (const timing of Object.values(messageTimingByID)) {
+    if (timing.sessionID !== sessionID || timing.firstTokenAt) continue
+    if (!best || timing.requestStartAt > best.requestStartAt) {
+      best = timing
+    }
+  }
+
+  return best
+}
+
+function parseProxyPrefill(value: unknown): { total: number; cache: number; processed: number; timeMs: number; done: boolean } | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const data = value as ProxyPrefillPayload
+
+  if (data.found !== true) return undefined
+  if (
+    !Number.isFinite(data.total)
+    || !Number.isFinite(data.cache)
+    || !Number.isFinite(data.processed)
+    || !Number.isFinite(data.time_ms)
+    || typeof data.total !== "number"
+    || typeof data.cache !== "number"
+    || typeof data.processed !== "number"
+    || typeof data.time_ms !== "number"
+  ) {
+    return undefined
+  }
+
+  if (data.total <= 0 || data.cache < 0 || data.processed < 0 || data.time_ms < 0) return undefined
+  if (data.processed > data.total && data.done !== true) return undefined
+
+  return {
+    total: data.total,
+    cache: data.cache,
+    processed: data.processed,
+    timeMs: data.time_ms,
+    done: data.done === true,
+  }
+}
+
+function formatPrefillEta(prefill: PrefillProgress): string {
+  const realProcessed = prefill.processed - prefill.cache
+  const realTotal = prefill.total - prefill.cache
+  if (realProcessed <= 0 || prefill.timeMs <= 0) return ""
+
+  const realRatePerSec = realProcessed / (prefill.timeMs / 1000)
+  if (!Number.isFinite(realRatePerSec) || realRatePerSec <= 0) return ""
+
+  const remainingSec = (realTotal - realProcessed) / realRatePerSec
+  if (!Number.isFinite(remainingSec) || remainingSec < 1) return ""
+  if (remainingSec >= 60) return ` · ~${Math.floor(remainingSec / 60)}m left`
+  return ` · ~${Math.floor(remainingSec)}s left`
 }
 
 function SessionPromptRight(props: {
@@ -107,6 +188,22 @@ function SessionPromptRight(props: {
   })
 
   const text = createMemo(() => {
+    props.version()
+    props.clock()
+
+    const status = props.api.state.session.status(props.sessionID)
+    const prefill = props.tracker.prefillBySession[props.sessionID]
+    if (status?.type !== "idle" && prefill && prefill.total > 0) {
+      const pct = Math.floor((prefill.processed / prefill.total) * 100)
+      return `Prefill ${prefill.processed.toLocaleString()}/${prefill.total.toLocaleString()} (${pct}%)${formatPrefillEta(prefill)}`
+    }
+
+    const activeTiming = findActiveTimingForSession(props.tracker.messageTimingByID, props.sessionID)
+    if (status?.type !== "idle" && activeTiming) {
+      const elapsedSec = Math.max(0, Math.floor((Date.now() - activeTiming.requestStartAt) / 1000))
+      return `Prefill ${elapsedSec}s`
+    }
+
     const live = liveTps() ?? "-"
     const avg = sessionAverage() ?? "-"
     const ttft = sessionTtft() ?? "-"
@@ -121,11 +218,128 @@ const tui: TuiPlugin = async (api) => {
     streamSamplesBySession: {},
     messageTimingByID: {},
     sessionAverageByID: {},
+    prefillBySession: {},
   }
   const [version, setVersion] = createSignal(0)
   const [clock, setClock] = createSignal(Date.now())
+  let prefillPollInFlight = false
+  let loggedPrefillPollFailure = false
 
   const bump = () => setVersion((value) => value + 1)
+
+  const clearPrefillProgress = (sessionID: string) => {
+    if (!tracker.prefillBySession[sessionID]) return
+    delete tracker.prefillBySession[sessionID]
+    bump()
+  }
+
+  const prunePrefill = () => {
+    let changed = false
+
+    for (const sessionID of Object.keys(tracker.prefillBySession)) {
+      if (api.state.session.status(sessionID)?.type === "idle") {
+        delete tracker.prefillBySession[sessionID]
+        changed = true
+      }
+    }
+
+    if (changed) bump()
+  }
+
+  const setPrefillProgress = (sessionID: string, next: PrefillProgress | undefined) => {
+    const prev = tracker.prefillBySession[sessionID]
+
+    if (!next) {
+      if (!prev) return
+      delete tracker.prefillBySession[sessionID]
+      bump()
+      return
+    }
+
+    if (
+      prev
+      && prev.total === next.total
+      && prev.cache === next.cache
+      && prev.processed === next.processed
+      && prev.timeMs === next.timeMs
+    ) {
+      return
+    }
+
+    tracker.prefillBySession[sessionID] = next
+    bump()
+  }
+
+  const activeSessionMessages = () => {
+    const result: Record<string, { messageID: string; timing: MessageTiming }> = {}
+
+    for (const [messageID, timing] of Object.entries(tracker.messageTimingByID)) {
+      if (timing.firstTokenAt) continue
+      const existing = result[timing.sessionID]
+      if (!existing || timing.requestStartAt > existing.timing.requestStartAt) {
+        result[timing.sessionID] = { messageID, timing }
+      }
+    }
+
+    return result
+  }
+
+  const pollPrefillProgress = async () => {
+    if (prefillPollInFlight) return
+    prefillPollInFlight = true
+
+    try {
+      const active = activeSessionMessages()
+      const activeSessionIDs = new Set(Object.keys(active))
+
+      for (const sessionID of Object.keys(tracker.prefillBySession)) {
+        if (!activeSessionIDs.has(sessionID) || api.state.session.status(sessionID)?.type === "idle") {
+          setPrefillProgress(sessionID, undefined)
+        }
+      }
+
+      for (const [sessionID, current] of Object.entries(active)) {
+        if (api.state.session.status(sessionID)?.type === "idle") {
+          setPrefillProgress(sessionID, undefined)
+          continue
+        }
+
+        const url = new URL(PREFILL_PROGRESS_URL)
+        url.searchParams.set("session_id", sessionID)
+        url.searchParams.set("message_id", current.messageID)
+
+        const response = await fetch(url)
+        if (!response.ok) {
+          setPrefillProgress(sessionID, undefined)
+          continue
+        }
+
+        const payload = parseProxyPrefill((await response.json()) as unknown)
+        if (!payload) {
+          setPrefillProgress(sessionID, undefined)
+          continue
+        }
+
+        setPrefillProgress(sessionID, {
+          sessionID,
+          total: payload.total,
+          cache: payload.cache,
+          processed: payload.processed,
+          timeMs: payload.timeMs,
+          receivedAt: Date.now(),
+        })
+      }
+
+      loggedPrefillPollFailure = false
+    } catch {
+      if (!loggedPrefillPollFailure) {
+        console.warn("oc-tps: prefill progress polling failed; using elapsed prefill fallback.")
+        loggedPrefillPollFailure = true
+      }
+    } finally {
+      prefillPollInFlight = false
+    }
+  }
 
   const pruneSamples = (now = Date.now()) => {
     let changed = false
@@ -174,6 +388,7 @@ const tui: TuiPlugin = async (api) => {
     const part = parts.find((item) => item.id === evt.properties.partID)
     if (!part) return
     if (part.type !== "text" && part.type !== "reasoning") return
+    clearPrefillProgress(evt.properties.sessionID)
     appendSample(evt.properties.sessionID, evt.properties.messageID, {
       at: Date.now(),
       tokens: estimateStreamTokens(evt.properties.delta),
@@ -196,6 +411,8 @@ const tui: TuiPlugin = async (api) => {
       bump()
       return
     }
+
+    clearPrefillProgress(evt.properties.sessionID)
 
     const timing = tracker.messageTimingByID[evt.properties.info.id]
     if (timing?.sessionID === evt.properties.sessionID && typeof timing.firstResponseAt === "number") {
@@ -256,7 +473,9 @@ const tui: TuiPlugin = async (api) => {
   const timer = setInterval(() => {
     setClock(Date.now())
     pruneSamples()
-  }, 1000)
+    prunePrefill()
+    void pollPrefillProgress()
+  }, PREFILL_POLL_MS)
 
   api.lifecycle.onDispose(() => {
     onDelta()
