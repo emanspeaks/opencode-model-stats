@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  version-check:
+    name: Version must be bumped
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check version changed vs main
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          MAIN=$(git show origin/main:package.json | node -e \
+            "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>process.stdout.write(JSON.parse(d).version))")
+          echo "This branch : $CURRENT"
+          echo "main        : $MAIN"
+          if [ "$CURRENT" = "$MAIN" ]; then
+            echo "::error::package.json version must be bumped in every PR to main. Update the version field before merging."
+            exit 1
+          fi
+
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build and test
+        run: bun run build
