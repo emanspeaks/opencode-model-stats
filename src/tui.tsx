@@ -133,7 +133,6 @@ function formatPrefillEta(prefill: PrefillProgress): string {
 
   const remainingSec = (realTotal - realProcessed) / realRatePerSec
   if (!Number.isFinite(remainingSec) || remainingSec < 1) return ""
-  if (remainingSec >= 60) return ` · ~${Math.floor(remainingSec / 60)}m left`
   return ` · ~${Math.floor(remainingSec)}s left`
 }
 
