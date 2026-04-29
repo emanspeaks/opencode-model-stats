@@ -547,6 +547,16 @@ const tui: TuiPlugin = async (api, options) => {
       bump()
       return
     }
+    if (
+      evt.properties.part.state.status === "completed" ||
+      evt.properties.part.state.status === "error"
+    ) {
+      if (timing.userMessageID) {
+        const queue = tracker.pendingUserMessagesBySession[timing.sessionID] ??= []
+        if (!queue.includes(timing.userMessageID)) queue.push(timing.userMessageID)
+      }
+      return
+    }
     if (evt.properties.part.state.status !== "running") return
     tracker.messageTimingByID[evt.properties.part.messageID] = {
       ...timing,
