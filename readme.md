@@ -115,14 +115,15 @@ The plugin expects the proxy to expose:
 Response JSON (snake_case):
 
 - `found: boolean`
+- `started: boolean` — `false` while queued but not yet picked up by the decoder; `true` once decoding begins
 - `total: number`
 - `cache: number`
 - `processed: number`
 - `time_ms: number`
-- `done: boolean` (optional, supported)
+- `done: boolean` (optional)
 - `updated_at: number` (optional)
 
-The plugin currently uses `found`, `total`, `cache`, `processed`, and `time_ms`.
+The plugin shows prefill only when `found=true`, `started=true`, and `done` is absent or false. Responses with `started=false` are treated as queued and the display reverts to TPS stats. Proxies that omit `started` are treated as always started (backward compatible).
 
 ## Reference Proxy Implementation
 
