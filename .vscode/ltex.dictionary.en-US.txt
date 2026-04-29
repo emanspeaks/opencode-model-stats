@@ -1,1 +1,7 @@
 TTFT
+
+opencode-model-stats
+oc-tps
+OpenCode
+cpp-style
+params
