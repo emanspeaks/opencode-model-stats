@@ -197,6 +197,7 @@ function SessionPromptRight(props: {
 }
 
 const tui: TuiPlugin = async (api, options) => {
+  const pluginInitTime = Date.now()
   const prefillProgressUrl = (typeof options?.prefillProgressUrl === "string"
     ? options.prefillProgressUrl
     : DEFAULT_PREFILL_PROGRESS_URL) + "/prefill-progress"
@@ -342,33 +343,67 @@ const tui: TuiPlugin = async (api, options) => {
         })
       }
 
-      // Background poll for queued user messages not yet assigned an assistant message.
-      // Only show prefill when found=true and done=false; anything else clears back to TPS.
+      // Poll every queued user message every cycle (treat the queue as an unordered set).
+      // Drop any that come back done=true. Among the rest, combine all that are
+      // currently reporting (found=true, started=true) into a single prefill display.
       for (const [sessionID, queue] of Object.entries(tracker.pendingUserMessagesBySession)) {
         if (activeSessionIDs.has(sessionID)) continue
         if (api.state.session.status(sessionID)?.type === "idle") continue
-        const nextUserMsgID = queue[0]
-        if (!nextUserMsgID) continue
+        if (queue.length === 0) continue
 
-        const url = new URL(getPrefillUrlForSession(sessionID))
-        url.searchParams.set("session_id", sessionID)
-        url.searchParams.set("message_id", nextUserMsgID)
+        const baseUrl = getPrefillUrlForSession(sessionID)
 
-        const response = await fetch(url)
-        if (!response.ok) continue
+        const results = await Promise.all(
+          queue.map(async (msgID) => {
+            try {
+              const u = new URL(baseUrl)
+              u.searchParams.set("session_id", sessionID)
+              u.searchParams.set("message_id", msgID)
+              const r = await fetch(u)
+              if (!r.ok) return { msgID, payload: undefined }
+              return { msgID, payload: parseProxyPrefill((await r.json()) as unknown) }
+            } catch {
+              return { msgID, payload: undefined }
+            }
+          }),
+        )
 
-        const payload = parseProxyPrefill((await response.json()) as unknown)
-        if (!payload || payload.done || !payload.started) {
+        const doneIDs = new Set<string>()
+        for (const { msgID, payload } of results) {
+          if (payload?.done) doneIDs.add(msgID)
+        }
+        if (doneIDs.size > 0) {
+          const remaining = queue.filter((id) => !doneIDs.has(id))
+          if (remaining.length === 0) delete tracker.pendingUserMessagesBySession[sessionID]
+          else tracker.pendingUserMessagesBySession[sessionID] = remaining
+        }
+
+        const reporting = results
+          .map((r) => r.payload)
+          .filter((p): p is NonNullable<ReturnType<typeof parseProxyPrefill>> =>
+            p !== undefined && !p.done && p.started)
+
+        if (reporting.length === 0) {
           setPrefillProgress(sessionID, undefined)
           continue
         }
 
+        const combined = reporting.reduce(
+          (acc, p) => ({
+            total: acc.total + p.total,
+            cache: acc.cache + p.cache,
+            processed: acc.processed + p.processed,
+            timeMs: acc.timeMs + p.timeMs,
+          }),
+          { total: 0, cache: 0, processed: 0, timeMs: 0 },
+        )
+
         setPrefillProgress(sessionID, {
           sessionID,
-          total: payload.total,
-          cache: payload.cache,
-          processed: payload.processed,
-          timeMs: payload.timeMs,
+          total: combined.total,
+          cache: combined.cache,
+          processed: combined.processed,
+          timeMs: combined.timeMs,
           receivedAt: Date.now(),
         })
       }
@@ -440,8 +475,9 @@ const tui: TuiPlugin = async (api, options) => {
 
   const onMessage = api.event.on("message.updated", (evt) => {
     if (evt.properties.info.role === "user") {
+      if (evt.properties.info.time.created < pluginInitTime) return
       const queue = tracker.pendingUserMessagesBySession[evt.properties.sessionID] ??= []
-      queue.push(evt.properties.info.id)
+      if (!queue.includes(evt.properties.info.id)) queue.push(evt.properties.info.id)
       return
     }
 
