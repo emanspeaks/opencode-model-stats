@@ -24,6 +24,7 @@ type PrefillProgress = {
 
 type MessageTiming = {
   sessionID: string
+  userMessageID?: string
   requestStartAt: number
   firstResponseAt?: number
   firstTokenAt?: number
@@ -43,6 +44,7 @@ type TrackerState = {
   messageTimingByID: Record<string, MessageTiming>
   sessionAverageByID: Record<string, SessionAverage>
   prefillBySession: Record<string, PrefillProgress>
+  pendingUserMessagesBySession: Record<string, string[]>
 }
 
 type ProxyPrefillPayload = {
@@ -87,19 +89,6 @@ function activeDurationMs(samples: StreamSample[], tailAt?: number) {
   }
 
   return Math.max(duration, SINGLE_SAMPLE_MS)
-}
-
-function findActiveTimingForSession(messageTimingByID: Record<string, MessageTiming>, sessionID: string): MessageTiming | undefined {
-  let best: MessageTiming | undefined
-
-  for (const timing of Object.values(messageTimingByID)) {
-    if (timing.sessionID !== sessionID || timing.firstTokenAt) continue
-    if (!best || timing.requestStartAt > best.requestStartAt) {
-      best = timing
-    }
-  }
-
-  return best
 }
 
 function parseProxyPrefill(value: unknown): { total: number; cache: number; processed: number; timeMs: number; done: boolean } | undefined {
@@ -196,12 +185,6 @@ function SessionPromptRight(props: {
       return `Prefill ${prefill.processed.toLocaleString()}/${prefill.total.toLocaleString()} (${pct}%)${formatPrefillEta(prefill)}`
     }
 
-    const activeTiming = findActiveTimingForSession(props.tracker.messageTimingByID, props.sessionID)
-    if (status?.type !== "idle" && activeTiming) {
-      const elapsedSec = Math.max(0, Math.floor((Date.now() - activeTiming.requestStartAt) / 1000))
-      return `Prefill ${elapsedSec}s`
-    }
-
     const live = liveTps() ?? "-"
     const avg = sessionAverage() ?? "-"
     const ttft = sessionTtft() ?? "-"
@@ -224,6 +207,7 @@ const tui: TuiPlugin = async (api, options) => {
     messageTimingByID: {},
     sessionAverageByID: {},
     prefillBySession: {},
+    pendingUserMessagesBySession: {},
   }
   const [version, setVersion] = createSignal(0)
   const [clock, setClock] = createSignal(Date.now())
@@ -245,6 +229,12 @@ const tui: TuiPlugin = async (api, options) => {
       if (api.state.session.status(sessionID)?.type === "idle") {
         delete tracker.prefillBySession[sessionID]
         changed = true
+      }
+    }
+
+    for (const sessionID of Object.keys(tracker.pendingUserMessagesBySession)) {
+      if (api.state.session.status(sessionID)?.type === "idle") {
+        delete tracker.pendingUserMessagesBySession[sessionID]
       }
     }
 
@@ -315,7 +305,8 @@ const tui: TuiPlugin = async (api, options) => {
       const activeSessionIDs = new Set(Object.keys(active))
 
       for (const sessionID of Object.keys(tracker.prefillBySession)) {
-        if (!activeSessionIDs.has(sessionID) || api.state.session.status(sessionID)?.type === "idle") {
+        const hasPending = (tracker.pendingUserMessagesBySession[sessionID]?.length ?? 0) > 0
+        if (api.state.session.status(sessionID)?.type === "idle" || (!activeSessionIDs.has(sessionID) && !hasPending)) {
           setPrefillProgress(sessionID, undefined)
         }
       }
@@ -328,16 +319,44 @@ const tui: TuiPlugin = async (api, options) => {
 
         const url = new URL(getPrefillUrlForSession(sessionID))
         url.searchParams.set("session_id", sessionID)
-        url.searchParams.set("message_id", current.messageID)
+        url.searchParams.set("message_id", current.timing.userMessageID ?? current.messageID)
 
         const response = await fetch(url)
-        if (!response.ok) {
+        if (!response.ok) continue
+
+        const payload = parseProxyPrefill((await response.json()) as unknown)
+        if (!payload || payload.done) {
           setPrefillProgress(sessionID, undefined)
           continue
         }
 
+        setPrefillProgress(sessionID, {
+          sessionID,
+          total: payload.total,
+          cache: payload.cache,
+          processed: payload.processed,
+          timeMs: payload.timeMs,
+          receivedAt: Date.now(),
+        })
+      }
+
+      // Background poll for queued user messages not yet assigned an assistant message.
+      // Only show prefill when found=true and done=false; anything else clears back to TPS.
+      for (const [sessionID, queue] of Object.entries(tracker.pendingUserMessagesBySession)) {
+        if (activeSessionIDs.has(sessionID)) continue
+        if (api.state.session.status(sessionID)?.type === "idle") continue
+        const nextUserMsgID = queue[0]
+        if (!nextUserMsgID) continue
+
+        const url = new URL(getPrefillUrlForSession(sessionID))
+        url.searchParams.set("session_id", sessionID)
+        url.searchParams.set("message_id", nextUserMsgID)
+
+        const response = await fetch(url)
+        if (!response.ok) continue
+
         const payload = parseProxyPrefill((await response.json()) as unknown)
-        if (!payload) {
+        if (!payload || payload.done) {
           setPrefillProgress(sessionID, undefined)
           continue
         }
@@ -418,12 +437,21 @@ const tui: TuiPlugin = async (api, options) => {
   })
 
   const onMessage = api.event.on("message.updated", (evt) => {
+    if (evt.properties.info.role === "user") {
+      const queue = tracker.pendingUserMessagesBySession[evt.properties.sessionID] ??= []
+      queue.push(evt.properties.info.id)
+      return
+    }
+
     if (evt.properties.info.role !== "assistant") return
 
     if (!evt.properties.info.time.completed) {
       const existing = tracker.messageTimingByID[evt.properties.info.id]
+      const userMessageID = existing?.userMessageID
+        ?? tracker.pendingUserMessagesBySession[evt.properties.sessionID]?.shift()
       tracker.messageTimingByID[evt.properties.info.id] = {
         sessionID: evt.properties.sessionID,
+        userMessageID,
         requestStartAt: evt.properties.info.time.created,
         firstResponseAt: existing?.firstResponseAt,
         firstTokenAt: existing?.firstTokenAt,

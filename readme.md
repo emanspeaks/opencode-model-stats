@@ -17,9 +17,15 @@ Requires `opencode` `1.4` or newer.
 
 ## Configuration
 
-Add the plugin to your `opencode.json` as a single entry:
+OpenCode uses two separate config files for two separate processes:
+
+- **`opencode.json`** — server/runtime process, reads the `server` export
+- **`tui.json`** — terminal UI process, reads the `tui` export
+
+Add the plugin to **both** files to get the full feature set:
 
 ```json
+// opencode.json
 {
   "plugin": [
     "opencode-model-stats"
@@ -27,16 +33,25 @@ Add the plugin to your `opencode.json` as a single entry:
 }
 ```
 
-The default entry point loads both the TUI component (live stats display) and the server component (correlation header injection) together. OpenCode picks up whichever is relevant for each process.
+```json
+// tui.json
+{
+  "plugin": [
+    "opencode-model-stats"
+  ]
+}
+```
+
+The default entry point exports both components. Each process picks up only what it needs.
 
 ### Plugin options
 
-Pass options as a second element in the tuple:
+Options are passed as a second element in the tuple and apply to whichever component that config file loads:
 
 ```json
 {
   "plugin": [
-    ["opencode-model-stats", { "debug": true }]
+    ["opencode-model-stats", { "debug": true, "prefillPollMs": 500 }]
   ]
 }
 ```
@@ -65,13 +80,13 @@ Default: `250`
 
 ### Individual entry points
 
-The individual components are also available separately if needed:
+The TUI and server components are also available as separate entry points if you only need one:
 
-| Entry point | Loads |
+| Entry point | Component |
 | --- | --- |
-| `opencode-model-stats` | Both TUI and server (recommended) |
-| `opencode-model-stats/tui` | TUI stats display only |
-| `opencode-model-stats/server` | Correlation header injection only |
+| `opencode-model-stats` | Both (recommended — add to both config files) |
+| `opencode-model-stats/tui` | TUI stats display only (`tui.json`) |
+| `opencode-model-stats/server` | Correlation header injection only (`opencode.json`) |
 
 ## Prefill Progress Via Proxy
 
@@ -86,7 +101,7 @@ When generation starts, it automatically switches back to:
 
 - `TPS X | AVG Y | TTFT Z`
 
-If the proxy endpoint is unavailable or returns no record, the plugin falls back to a simple elapsed prefill display.
+If the proxy endpoint is unavailable or returns no record (`found` is false or `done` is true), the display reverts to TPS stats.
 
 ## Proxy Contract
 
