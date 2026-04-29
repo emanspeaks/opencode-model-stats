@@ -1,11 +1,17 @@
 {
   "$schema": "https://www.schemastore.org/package.json",
   "name": "opencode-model-stats",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "type": "module",
   "exports": {
+    ".": {
+      "import": "./src/index.ts"
+    },
     "./tui": {
       "import": "./src/tui.tsx"
+    },
+    "./server": {
+      "import": "./src/server.ts"
     }
   },
   "files": [
