@@ -21,7 +21,7 @@ export const llm = { onRequest } as const
 const server: Plugin = async (_input, options) => {
   const debug = options?.["debug"] === true
 
-  const log = (...args: unknown[]) => console.log("[oc-tps]", ...args)
+  const log = (...args: unknown[]) => console.log("[opencode-model-stats]", ...args)
 
   if (debug) log("server plugin initialized, debug logging enabled")
 
@@ -51,7 +51,7 @@ const server: Plugin = async (_input, options) => {
             if (debug) log(`chat.headers: callback ${i} returned`, extra)
             Object.assign(output.headers, extra)
           } catch (err) {
-            console.warn("oc-tps: llm.onRequest callback threw, skipping:", err)
+            console.warn("opencode-model-stats: llm.onRequest callback threw, skipping:", err)
           }
         }
       }
@@ -64,7 +64,7 @@ const server: Plugin = async (_input, options) => {
 type ServerModule = PluginModule & { id: string; llm: typeof llm }
 
 const plugin: ServerModule = {
-  id: "oc-tps",
+  id: "opencode-model-stats",
   server,
   llm,
 }
