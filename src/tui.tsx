@@ -49,6 +49,7 @@ type TrackerState = {
 
 type ProxyPrefillPayload = {
   found?: unknown
+  started?: unknown
   total?: unknown
   cache?: unknown
   processed?: unknown
@@ -60,11 +61,11 @@ function estimateStreamTokens(delta: string) {
   return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 5))
 }
 
-function formatRate(value: number, label: "TPS" | "AVG") {
+function formatRate(value: number) {
   if (!Number.isFinite(value) || value <= 0) return undefined
-  if (value >= 100) return `${Math.round(value)}${label === "TPS" ? " TPS" : ""}`
-  if (value >= 10) return `${value.toFixed(1)}${label === "TPS" ? " TPS" : ""}`
-  return `${value.toFixed(2)}${label === "TPS" ? " TPS" : ""}`
+  if (value >= 100) return `${Math.round(value)}`
+  if (value >= 10) return `${value.toFixed(1)}`
+  return `${value.toFixed(2)}`
 }
 
 function formatTtft(value: number) {
@@ -91,7 +92,7 @@ function activeDurationMs(samples: StreamSample[], tailAt?: number) {
   return Math.max(duration, SINGLE_SAMPLE_MS)
 }
 
-function parseProxyPrefill(value: unknown): { total: number; cache: number; processed: number; timeMs: number; done: boolean } | undefined {
+function parseProxyPrefill(value: unknown): { total: number; cache: number; processed: number; timeMs: number; done: boolean; started: boolean } | undefined {
   if (!value || typeof value !== "object") return undefined
   const data = value as ProxyPrefillPayload
 
@@ -118,6 +119,7 @@ function parseProxyPrefill(value: unknown): { total: number; cache: number; proc
     processed: data.processed,
     timeMs: data.time_ms,
     done: data.done === true,
+    started: data.started !== false,
   }
 }
 
@@ -146,7 +148,7 @@ function SessionPromptRight(props: {
     props.version()
     const totals = props.tracker.sessionAverageByID[props.sessionID]
     if (!totals || totals.totalTokens <= 0 || totals.totalDurationMs <= 0) return undefined
-    return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000), "AVG")
+    return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000))
   })
 
   const sessionTtft = createMemo(() => {
@@ -171,7 +173,7 @@ function SessionPromptRight(props: {
     const total = relevant.reduce((sum, sample) => sum + sample.tokens, 0)
     const durationSeconds = activeDurationMs(relevant, now) / 1000
     if (durationSeconds <= 0) return undefined
-    return formatRate(total / durationSeconds, "AVG")
+    return formatRate(total / durationSeconds)
   })
 
   const text = createMemo(() => {
@@ -188,7 +190,7 @@ function SessionPromptRight(props: {
     const live = liveTps() ?? "-"
     const avg = sessionAverage() ?? "-"
     const ttft = sessionTtft() ?? "-"
-    return `TPS ${live} | AVG ${avg} | TTFT ${ttft}`
+    return `${live} t/s | AVG ${avg} t/s | TTFT ${ttft}`
   })
 
   return <>{text() ? <text fg={props.api.theme.current.textMuted}>{text()}</text> : null}</>
@@ -325,7 +327,7 @@ const tui: TuiPlugin = async (api, options) => {
         if (!response.ok) continue
 
         const payload = parseProxyPrefill((await response.json()) as unknown)
-        if (!payload || payload.done) {
+        if (!payload || payload.done || !payload.started) {
           setPrefillProgress(sessionID, undefined)
           continue
         }
@@ -356,7 +358,7 @@ const tui: TuiPlugin = async (api, options) => {
         if (!response.ok) continue
 
         const payload = parseProxyPrefill((await response.json()) as unknown)
-        if (!payload || payload.done) {
+        if (!payload || payload.done || !payload.started) {
           setPrefillProgress(sessionID, undefined)
           continue
         }
@@ -467,11 +469,9 @@ const tui: TuiPlugin = async (api, options) => {
     const timing = tracker.messageTimingByID[evt.properties.info.id]
     if (timing?.sessionID === evt.properties.sessionID && typeof timing.firstResponseAt === "number") {
       const totalTokens = evt.properties.info.tokens.output + evt.properties.info.tokens.reasoning
-      const endAt =
-        evt.properties.info.finish === "tool-calls"
-          ? timing.lastToolCallAt
-          : evt.properties.info.time.completed
-      const durationMs = typeof endAt === "number" ? Math.max(endAt - timing.firstResponseAt, 1) : undefined
+      const durationMs = timing.firstTokenAt && timing.lastTokenAt
+        ? Math.max(timing.lastTokenAt - timing.firstTokenAt, SINGLE_SAMPLE_MS)
+        : undefined
       const ttftMs = Math.max(timing.firstResponseAt - timing.requestStartAt, 0)
       if (totalTokens > 0 && durationMs) {
         const totals = tracker.sessionAverageByID[evt.properties.sessionID] ?? {
