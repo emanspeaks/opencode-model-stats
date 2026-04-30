@@ -122,8 +122,10 @@ The plugin opens a single WebSocket connection and listens for server-push messa
 
 ### WebSocket endpoint
 
-- `GET /prefill-ws` — upgraded to WebSocket
+- `GET /prefill-ws` (or `/v1/prefill-ws`) — upgraded to WebSocket
 - The client sends nothing; the server pushes JSON messages
+- Multiple clients may connect simultaneously; each receives the same broadcasts
+- Progress entries are evicted automatically after inactivity (TTL ~180s)
 
 ### Push message format
 
