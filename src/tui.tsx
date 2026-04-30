@@ -342,9 +342,9 @@ const tui: TuiPlugin = async (api, options) => {
         })
       }
 
-      // Poll every queued user message every cycle (treat the queue as an unordered set).
-      // Drop any that come back done=true. Among the rest, combine all that are
-      // currently reporting (found=true, started=true) into a single prefill display.
+      // Poll every queued user message every cycle (unordered set).
+      // Entries are only removed when the assistant turn completes or the session goes idle.
+      // done=true is silently skipped for display (proxy may reset the key on the next tool roundtrip).
       for (const [sessionID, queue] of Object.entries(tracker.pendingUserMessagesBySession)) {
         if (activeSessionIDs.has(sessionID)) continue
         if (api.state.session.status(sessionID)?.type === "idle") continue
@@ -366,16 +366,6 @@ const tui: TuiPlugin = async (api, options) => {
             }
           }),
         )
-
-        const doneIDs = new Set<string>()
-        for (const { msgID, payload } of results) {
-          if (payload?.done) doneIDs.add(msgID)
-        }
-        if (doneIDs.size > 0) {
-          const remaining = queue.filter((id) => !doneIDs.has(id))
-          if (remaining.length === 0) delete tracker.pendingUserMessagesBySession[sessionID]
-          else tracker.pendingUserMessagesBySession[sessionID] = remaining
-        }
 
         const reporting = results
           .map((r) => r.payload)
@@ -520,6 +510,16 @@ const tui: TuiPlugin = async (api, options) => {
           totalDurationMs: totals.totalDurationMs + durationMs,
           totalTtftMs: totals.totalTtftMs + ttftMs,
           messageCount: totals.messageCount + 1,
+        }
+      }
+    }
+    if (timing?.userMessageID) {
+      const pendingQueue = tracker.pendingUserMessagesBySession[evt.properties.sessionID]
+      if (pendingQueue) {
+        const idx = pendingQueue.indexOf(timing.userMessageID)
+        if (idx !== -1) {
+          pendingQueue.splice(idx, 1)
+          if (pendingQueue.length === 0) delete tracker.pendingUserMessagesBySession[evt.properties.sessionID]
         }
       }
     }
