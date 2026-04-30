@@ -13,14 +13,17 @@ const STREAM_WINDOW_MS = 5_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
 const DEFAULT_UPDATE_INTERVAL_MS = 250
+const EMA_ALPHA = 0.3  // weight for newest batch vs history
 
 type PrefillProgress = {
   sessionID: string
+  messageID: string
   total: number
   cache: number
   processed: number
   timeMs: number
   receivedAt: number
+  emaRate: number
 }
 
 type MessageTiming = {
@@ -43,10 +46,12 @@ type TrackerState = {
   messageTimingByID: Record<string, MessageTiming>
   sessionAverageByID: Record<string, SessionAverage>
   prefillBySession: Record<string, PrefillProgress>
+  lastPrefillByMessage: Record<string, PrefillProgress>
 }
 
 type WsPrefillMessage = {
   session_id?: unknown
+  message_id?: unknown
   total?: unknown
   cache?: unknown
   processed?: unknown
@@ -90,17 +95,18 @@ function activeDurationMs(samples: StreamSample[], tailAt?: number) {
   return Math.max(duration, SINGLE_SAMPLE_MS)
 }
 
-function parseWsMessage(value: unknown): { sessionID: string; done: boolean; started: boolean; total: number; cache: number; processed: number; timeMs: number } | undefined {
+function parseWsMessage(value: unknown): { sessionID: string; messageID: string; done: boolean; started: boolean; total: number; cache: number; processed: number; timeMs: number } | undefined {
   if (!value || typeof value !== "object") return undefined
   const data = value as WsPrefillMessage
 
   const sessionID = typeof data.session_id === "string" && data.session_id.length > 0 ? data.session_id : undefined
   if (!sessionID) return undefined
 
+  const messageID = typeof data.message_id === "string" ? data.message_id : ""
   const done = data.done === true
   const started = data.started !== false
 
-  if (done) return { sessionID, done: true, started, total: 0, cache: 0, processed: 0, timeMs: 0 }
+  if (done) return { sessionID, messageID, done: true, started, total: 0, cache: 0, processed: 0, timeMs: 0 }
 
   if (
     typeof data.total !== "number" || !Number.isFinite(data.total)
@@ -111,20 +117,27 @@ function parseWsMessage(value: unknown): { sessionID: string; done: boolean; sta
 
   if (data.total <= 0 || data.cache < 0 || data.processed < 0 || data.time_ms < 0) return undefined
 
-  return { sessionID, done: false, started, total: data.total, cache: data.cache, processed: data.processed, timeMs: data.time_ms }
+  return { sessionID, messageID, done: false, started, total: data.total, cache: data.cache, processed: data.processed, timeMs: data.time_ms }
 }
 
-function formatPrefillEta(prefill: PrefillProgress): string {
+function formatPrefillEta(prefill: PrefillProgress, last: PrefillProgress | undefined): string {
   const realProcessed = prefill.processed - prefill.cache
   const realTotal = prefill.total - prefill.cache
   if (realProcessed <= 0 || prefill.timeMs <= 0) return ""
 
-  const realRatePerSec = realProcessed / (prefill.timeMs / 1000)
-  if (!Number.isFinite(realRatePerSec) || realRatePerSec <= 0) return ""
-
-  const remainingSec = (realTotal - realProcessed) / realRatePerSec
-  if (!Number.isFinite(remainingSec) || remainingSec < 1) return ""
-  return ` | ${formatRate(realRatePerSec)} t/s | ~${Math.floor(remainingSec)}s left`
+  const lastValid = last && last.messageID === prefill.messageID && prefill.timeMs > last.timeMs
+  const lastProcessed = lastValid ? last.processed - last.cache : 0
+  const lastTimeMs = lastValid ? last.timeMs : 0
+  const deltaProcessed = realProcessed - lastProcessed
+  const deltaMs = prefill.timeMs - lastTimeMs
+  const batchRate = deltaMs > 0 ? deltaProcessed / deltaMs * 1000 : 0
+  const emaRate = lastValid && last.emaRate > 0 ? (1 - EMA_ALPHA) * last.emaRate + EMA_ALPHA * batchRate : batchRate
+  prefill.emaRate = emaRate
+  if (!Number.isFinite(emaRate) || emaRate <= 0) return ""
+  let ratestr = ` | ${formatRate(batchRate)} t/s (EMA ${formatRate(emaRate)})`
+  const remainingSec = (realTotal*realTotal - realProcessed*realProcessed) / (2*emaRate*realProcessed)
+  if (!Number.isFinite(remainingSec) || remainingSec < 1) return ratestr
+  return `${ratestr} | ~${Math.floor(remainingSec)}s`
 }
 
 function SessionPromptRight(props: {
@@ -174,7 +187,8 @@ function SessionPromptRight(props: {
     const prefill = props.tracker.prefillBySession[props.sessionID]
     if (status?.type !== "idle" && prefill && prefill.total > 0) {
       const pct = Math.floor((prefill.processed / prefill.total) * 100)
-      return `Prefill ${prefill.processed.toLocaleString()}/${prefill.total.toLocaleString()} (${pct}%)${formatPrefillEta(prefill)}`
+      const last = prefill.messageID ? props.tracker.lastPrefillByMessage[prefill.messageID] : undefined
+      return `Prefill ${prefill.processed.toLocaleString()}/${prefill.total.toLocaleString()} (${pct}%)${formatPrefillEta(prefill, last)}`
     }
 
     const live = liveTps() ?? "-"
@@ -222,6 +236,7 @@ const tui: TuiPlugin = async (api, options) => {
     messageTimingByID: {},
     sessionAverageByID: {},
     prefillBySession: {},
+    lastPrefillByMessage: {},
   }
   const [version, setVersion] = createSignal(0)
   const [clock, setClock] = createSignal(Date.now())
@@ -229,7 +244,9 @@ const tui: TuiPlugin = async (api, options) => {
   const bump = () => setVersion((v) => v + 1)
 
   const clearPrefillProgress = (sessionID: string) => {
-    if (!tracker.prefillBySession[sessionID]) return
+    const prev = tracker.prefillBySession[sessionID]
+    if (!prev) return
+    if (prev.messageID) delete tracker.lastPrefillByMessage[prev.messageID]
     delete tracker.prefillBySession[sessionID]
     bump()
   }
@@ -239,7 +256,16 @@ const tui: TuiPlugin = async (api, options) => {
 
     for (const sessionID of Object.keys(tracker.prefillBySession)) {
       if (api.state.session.status(sessionID)?.type === "idle") {
+        const prev = tracker.prefillBySession[sessionID]
+        if (prev?.messageID) delete tracker.lastPrefillByMessage[prev.messageID]
         delete tracker.prefillBySession[sessionID]
+        changed = true
+      }
+    }
+
+    for (const [msgID, prefill] of Object.entries(tracker.lastPrefillByMessage)) {
+      if (api.state.session.status(prefill.sessionID)?.type === "idle") {
+        delete tracker.lastPrefillByMessage[msgID]
         changed = true
       }
     }
@@ -259,6 +285,7 @@ const tui: TuiPlugin = async (api, options) => {
 
     if (!next) {
       if (!prev) return
+      if (prev.messageID) delete tracker.lastPrefillByMessage[prev.messageID]
       delete tracker.prefillBySession[sessionID]
       bump()
       return
@@ -266,12 +293,21 @@ const tui: TuiPlugin = async (api, options) => {
 
     if (
       prev
+      && prev.messageID === next.messageID
       && prev.total === next.total
       && prev.cache === next.cache
       && prev.processed === next.processed
       && prev.timeMs === next.timeMs
     ) {
       return
+    }
+
+    if (prev && next.messageID) {
+      if (prev.messageID === next.messageID) {
+        tracker.lastPrefillByMessage[next.messageID] = prev
+      } else if (prev.messageID) {
+        delete tracker.lastPrefillByMessage[prev.messageID]
+      }
     }
 
     tracker.prefillBySession[sessionID] = next
@@ -363,11 +399,13 @@ const tui: TuiPlugin = async (api, options) => {
         } else {
           setPrefillProgress(msg.sessionID, {
             sessionID: msg.sessionID,
+            messageID: msg.messageID,
             total: msg.total,
             cache: msg.cache,
             processed: msg.processed,
             timeMs: msg.timeMs,
             receivedAt: Date.now(),
+            emaRate: -1,
           })
         }
       } catch (err) {
