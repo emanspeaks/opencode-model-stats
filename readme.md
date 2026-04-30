@@ -51,7 +51,7 @@ Options are passed as a second element in the tuple and apply to whichever compo
 ```json
 {
   "plugin": [
-    ["opencode-model-stats", { "debug": true, "prefillPollMs": 500 }]
+    ["opencode-model-stats", { "debug": true }]
   ]
 }
 ```
@@ -68,13 +68,26 @@ Set `debug: true` to enable verbose logging of the `chat.headers` path on every 
 
 Remove or set `"debug": false` once you have confirmed the headers are flowing correctly.
 
-#### `prefillProgressUrl`
+#### `tuiDebug`
 
-Base URL of the proxy (origin only, e.g. `"http://127.0.0.1:8080"`). The plugin always appends `/prefill-progress` to form the full endpoint URL. By default, the plugin derives this automatically from the active session's model API URL, so this only needs to be set if that automatic resolution produces the wrong address.
+Set `tuiDebug: true` to write verbose TUI diagnostic logs to `opencode-model-stats-tui.log` in the current working directory, or provide a string path to write elsewhere:
+
+```json
+["opencode-model-stats", { "tuiDebug": true }]
+["opencode-model-stats", { "tuiDebug": "/tmp/oms-tui.log" }]
+```
+
+The log file path is printed to the console on startup. The file is appended (not overwritten) so each session adds to the same file. Each session starts with a `=== started ... ===` separator line.
+
+#### `prefillWsUrl`
+
+WebSocket URL of the proxy's prefill push stream (see [Proxy Contract](#proxy-contract) below).
+
+Default: `ws://127.0.0.1:8080/prefill-ws`
 
 #### `prefillPollMs`
 
-Polling interval in milliseconds for prefill progress. Minimum enforced: `100`.
+Interval in milliseconds for the TUI clock and prune cycle. Controls how often the live TPS display refreshes and stale state is cleaned up. Minimum enforced: `100`.
 
 Default: `250`
 
@@ -92,38 +105,59 @@ The TUI and server components are also available as separate entry points if you
 
 This plugin supports a proxy-assisted prefill progress mode for local llama.cpp-style backends.
 
-During prompt prefill, the plugin polls a proxy endpoint for progress keyed by session and message IDs. When progress is available, the slot displays:
+During prompt prefill, the plugin receives push updates over a persistent WebSocket connection. When progress is available, the slot displays:
 
 - `Prefill X/Y (Z%)`
-- `Prefill X/Y (Z%) · ~Ns left` (or `~Nm left`) when ETA is computable
+- `Prefill X/Y (Z%) · ~Ns left` when ETA is computable
 
-When generation starts, it automatically switches back to:
+When generation starts, the proxy signals completion and the display automatically switches back to:
 
 - `TPS X | AVG Y | TTFT Z`
 
-If the proxy endpoint is unavailable or returns no record (`found` is false or `done` is true), the display reverts to TPS stats.
+If the WebSocket is unavailable the display simply shows TPS stats. The plugin reconnects automatically after a 2-second delay.
 
 ## Proxy Contract
 
-The plugin expects the proxy to expose:
+The plugin opens a single WebSocket connection and listens for server-push messages. No polling — the proxy broadcasts updates as they occur.
 
-- Endpoint: `GET /prefill-progress`
-- Query params:
-  - `session_id`
-  - `message_id`
+### WebSocket endpoint
 
-Response JSON (snake_case):
+- `GET /prefill-ws` — upgraded to WebSocket
+- The client sends nothing; the server pushes JSON messages
 
-- `found: boolean`
-- `started: boolean` — `false` while queued but not yet picked up by the decoder; `true` once decoding begins
-- `total: number`
-- `cache: number`
-- `processed: number`
-- `time_ms: number`
-- `done: boolean` (optional)
-- `updated_at: number` (optional)
+### Push message format
 
-The plugin shows prefill only when `found=true`, `started=true`, and `done` is absent or false. Responses with `started=false` are treated as queued and the display reverts to TPS stats. Proxies that omit `started` are treated as always started (backward compatible).
+Progress update (snake_case JSON):
+
+```json
+{
+  "session_id": "...",
+  "total": 1024,
+  "cache": 200,
+  "processed": 600,
+  "time_ms": 450,
+  "started": true,
+  "done": false
+}
+```
+
+Completion signal (sent when generation begins or the request ends):
+
+```json
+{ "session_id": "...", "done": true }
+```
+
+Field reference:
+
+- `session_id: string` — matches the `x-opencode-session-id` header injected by the server plugin
+- `total: number` — total tokens to prefill
+- `cache: number` — tokens served from KV cache (already done)
+- `processed: number` — tokens prefilled so far (including cache)
+- `time_ms: number` — elapsed prefill time in milliseconds
+- `started: boolean` — `false` while the request is queued; `true` once the decoder picks it up. Omit to default to `true` (backward compatible)
+- `done: boolean` — `true` when this request's prefill phase is over
+
+The plugin displays progress only when `started=true` and `done` is absent or false. Messages with `started=false` are silently ignored (display stays on TPS stats).
 
 ## Reference Proxy Implementation
 
