@@ -12,7 +12,6 @@ type StreamSample = {
 const STREAM_WINDOW_MS = 5_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
-const DEFAULT_PREFILL_WS_URL = "ws://127.0.0.1:8080/prefill-ws"
 const DEFAULT_UPDATE_INTERVAL_MS = 250
 
 type PrefillProgress = {
@@ -125,7 +124,7 @@ function formatPrefillEta(prefill: PrefillProgress): string {
 
   const remainingSec = (realTotal - realProcessed) / realRatePerSec
   if (!Number.isFinite(remainingSec) || remainingSec < 1) return ""
-  return ` · ~${Math.floor(remainingSec)}s left`
+  return ` | ${formatRate(realRatePerSec)} t/s | ~${Math.floor(remainingSec)}s left`
 }
 
 function SessionPromptRight(props: {
@@ -201,15 +200,22 @@ const tui: TuiPlugin = async (api, options) => {
     }
   })()
 
-  const prefillWsUrl = typeof options?.prefillWsUrl === "string" && options.prefillWsUrl.length > 0
-    ? options.prefillWsUrl
-    : DEFAULT_PREFILL_WS_URL
   const updateIntervalMs = (() => {
     const n = Number(options?.prefillPollMs)
     return Number.isFinite(n) && n > 0 ? Math.max(100, n) : DEFAULT_UPDATE_INTERVAL_MS
   })()
 
-  log?.("tui plugin initialized, wsUrl=" + prefillWsUrl)
+  const clog = (...args: unknown[]) => {
+    console.log("[opencode-model-stats/tui]", ...args)
+    log?.(...args)
+  }
+
+  // Explicit config URL overrides auto-derivation; null means derive from each session's model URL
+  const configWsUrl: string | null = typeof options?.prefillWsUrl === "string" && options.prefillWsUrl.length > 0
+    ? options.prefillWsUrl
+    : null
+
+  log?.("tui plugin initialized" + (configWsUrl ? ", wsUrl=" + configWsUrl : ", wsUrl=auto (derived from model API URL)"))
 
   const tracker: TrackerState = {
     streamSamplesBySession: {},
@@ -225,14 +231,6 @@ const tui: TuiPlugin = async (api, options) => {
   const clearPrefillProgress = (sessionID: string) => {
     if (!tracker.prefillBySession[sessionID]) return
     delete tracker.prefillBySession[sessionID]
-    bump()
-  }
-
-  const clearAllPrefill = () => {
-    if (Object.keys(tracker.prefillBySession).length === 0) return
-    for (const sessionID of Object.keys(tracker.prefillBySession)) {
-      delete tracker.prefillBySession[sessionID]
-    }
     bump()
   }
 
@@ -280,40 +278,86 @@ const tui: TuiPlugin = async (api, options) => {
     bump()
   }
 
-  // WebSocket connection to the proxy's prefill push stream
-  let ws: WebSocket | null = null
-  let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null
+  // Per-session current model WS URL, updated on each user message
+  const currentWsUrlBySession: Record<string, string> = {}
+  // Active WebSocket instances keyed by URL
+  const wsByUrl = new Map<string, WebSocket>()
+  // Pending reconnect timers keyed by URL
+  const wsReconnectsByUrl = new Map<string, ReturnType<typeof setTimeout>>()
   let wsDisposed = false
 
-  const scheduleReconnect = () => {
-    if (wsDisposed || wsReconnectTimer) return
-    wsReconnectTimer = setTimeout(() => {
-      wsReconnectTimer = null
-      connectWs()
-    }, 2_000)
+  const deriveWsUrl = (sessionID: string): string | null => {
+    const messages = api.state.session.messages(sessionID)
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i]
+      if (msg.role !== "user") continue
+      const provider = api.state.provider.find((p) => p.id === msg.model.providerID)
+      const model = provider?.models[msg.model.modelID]
+      if (model?.api.url) {
+        try {
+          const apiUrl = new URL(model.api.url)
+          const wsScheme = apiUrl.protocol === "https:" ? "wss:" : "ws:"
+          return `${wsScheme}//${apiUrl.host}/prefill-ws`
+        } catch {}
+      }
+      break
+    }
+    return null
   }
 
-  const connectWs = () => {
-    if (wsDisposed) return
-    log?.("ws: connecting")
+  const isUrlWanted = (url: string): boolean => {
+    if (wsDisposed) return false
+    if (url === configWsUrl) return true
+    return Object.values(currentWsUrlBySession).some((u) => u === url)
+  }
+
+  const clearPrefillForUrl = (url: string) => {
+    let changed = false
+    for (const [sessionID, u] of Object.entries(currentWsUrlBySession)) {
+      if (u === url && tracker.prefillBySession[sessionID]) {
+        delete tracker.prefillBySession[sessionID]
+        changed = true
+      }
+    }
+    if (changed) bump()
+  }
+
+  const scheduleReconnect = (url: string) => {
+    if (wsDisposed || wsReconnectsByUrl.has(url)) return
+    const timer = setTimeout(() => {
+      wsReconnectsByUrl.delete(url)
+      if (!wsDisposed && isUrlWanted(url)) openWs(url)
+    }, 2_000)
+    wsReconnectsByUrl.set(url, timer)
+  }
+
+  const openWs = (url: string) => {
+    if (wsDisposed || wsByUrl.has(url)) return
+    log?.("ws: connecting to " + url)
+    let socket: WebSocket
     try {
-      ws = new WebSocket(prefillWsUrl)
+      socket = new WebSocket(url)
     } catch (err) {
       log?.("ws: failed to construct WebSocket:", err)
-      scheduleReconnect()
+      scheduleReconnect(url)
       return
     }
+    wsByUrl.set(url, socket)
 
-    ws.onopen = () => {
-      log?.("ws: connected")
+    socket.onopen = () => {
+      clog("ws: connected:", url)
     }
 
-    ws.onmessage = (evt) => {
+    socket.onmessage = (evt) => {
       try {
         const raw = typeof evt.data === "string" ? evt.data : String(evt.data)
+        log?.("ws: raw message:", raw)
         const msg = parseWsMessage(JSON.parse(raw) as unknown)
-        if (!msg) return
-        log?.("ws: message", msg)
+        if (!msg) {
+          log?.("ws: message rejected by parser (unexpected shape)")
+          return
+        }
+        log?.("ws: parsed:", msg)
         if (msg.done || !msg.started) {
           clearPrefillProgress(msg.sessionID)
         } else {
@@ -331,19 +375,36 @@ const tui: TuiPlugin = async (api, options) => {
       }
     }
 
-    ws.onclose = (evt) => {
-      log?.(`ws: closed (code=${evt.code})`)
-      ws = null
-      clearAllPrefill()
-      scheduleReconnect()
+    socket.onclose = (evt) => {
+      if (wsByUrl.get(url) === socket) wsByUrl.delete(url)
+      clearPrefillForUrl(url)
+      if (isUrlWanted(url)) {
+        clog(`ws: closed (code=${evt.code}), reconnecting in 2s:`, url)
+        scheduleReconnect(url)
+      } else {
+        clog(`ws: closed (code=${evt.code}):`, url)
+      }
     }
 
-    ws.onerror = () => {
-      log?.("ws: error (close will follow)")
+    socket.onerror = () => {
+      log?.("ws: error (close will follow):", url)
     }
   }
 
-  connectWs()
+  const ensureWsConnected = (url: string) => {
+    if (wsDisposed || wsByUrl.has(url)) return
+    openWs(url)
+  }
+
+  const closeWsIfUnwanted = (url: string) => {
+    if (isUrlWanted(url)) return
+    const timer = wsReconnectsByUrl.get(url)
+    if (timer) { clearTimeout(timer); wsReconnectsByUrl.delete(url) }
+    const socket = wsByUrl.get(url)
+    if (socket) { socket.close() }  // onclose handles wsByUrl.delete and clearPrefillForUrl
+  }
+
+  if (configWsUrl) openWs(configWsUrl)
 
   const pruneSamples = (now = Date.now()) => {
     let changed = false
@@ -400,6 +461,17 @@ const tui: TuiPlugin = async (api, options) => {
   })
 
   const onMessage = api.event.on("message.updated", (evt) => {
+    if (evt.properties.info.role === "user") {
+      const url = configWsUrl ?? deriveWsUrl(evt.properties.sessionID)
+      if (url) {
+        const oldUrl = currentWsUrlBySession[evt.properties.sessionID]
+        currentWsUrlBySession[evt.properties.sessionID] = url
+        ensureWsConnected(url)
+        if (oldUrl && oldUrl !== url) closeWsIfUnwanted(oldUrl)
+      }
+      return
+    }
+
     if (evt.properties.info.role !== "assistant") return
 
     if (!evt.properties.info.time.completed) {
@@ -477,12 +549,10 @@ const tui: TuiPlugin = async (api, options) => {
     onPart()
     clearInterval(timer)
     wsDisposed = true
-    if (wsReconnectTimer) {
-      clearTimeout(wsReconnectTimer)
-      wsReconnectTimer = null
-    }
-    ws?.close()
-    ws = null
+    for (const timer of wsReconnectsByUrl.values()) clearTimeout(timer)
+    wsReconnectsByUrl.clear()
+    for (const socket of wsByUrl.values()) socket.close()
+    wsByUrl.clear()
   })
 
   api.slots.register({

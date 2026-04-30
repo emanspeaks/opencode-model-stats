@@ -83,7 +83,7 @@ The log file path is printed to the console on startup. The file is appended (no
 
 WebSocket URL of the proxy's prefill push stream (see [Proxy Contract](#proxy-contract) below).
 
-Default: `ws://127.0.0.1:8080/prefill-ws`
+By default, the URL is derived automatically from the model's API URL: the scheme is converted to `ws`/`wss` and `/prefill-ws` is appended to the origin. Set this option to override that derivation with a fixed URL.
 
 #### `prefillPollMs`
 
@@ -108,7 +108,7 @@ This plugin supports a proxy-assisted prefill progress mode for local llama.cpp-
 During prompt prefill, the plugin receives push updates over a persistent WebSocket connection. When progress is available, the slot displays:
 
 - `Prefill X/Y (Z%)`
-- `Prefill X/Y (Z%) · ~Ns left` when ETA is computable
+- `Prefill X/Y (Z%) | R t/s | ~Ns left` when ETA is computable
 
 When generation starts, the proxy signals completion and the display automatically switches back to:
 
@@ -116,9 +116,11 @@ When generation starts, the proxy signals completion and the display automatical
 
 If the WebSocket is unavailable the display simply shows TPS stats. The plugin reconnects automatically after a 2-second delay.
 
+The WebSocket connection stays open across turns and is only closed when the model URL changes (the old connection is released once no in-flight responses remain on it) or when the program exits.
+
 ## Proxy Contract
 
-The plugin opens a single WebSocket connection and listens for server-push messages. No polling — the proxy broadcasts updates as they occur.
+The plugin opens one persistent WebSocket connection per unique proxy URL and listens for server-push messages. No polling — the proxy broadcasts updates as they occur.
 
 ### WebSocket endpoint
 
