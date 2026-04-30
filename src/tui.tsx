@@ -1,5 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { appendFileSync } from "node:fs"
+import { resolve } from "node:path"
 import { createMemo, createSignal } from "solid-js"
 
 type StreamSample = {
@@ -10,8 +12,8 @@ type StreamSample = {
 const STREAM_WINDOW_MS = 5_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
-const DEFAULT_PREFILL_PROGRESS_URL = "http://127.0.0.1:8080"
-const DEFAULT_PREFILL_POLL_MS = 250
+const DEFAULT_PREFILL_WS_URL = "ws://127.0.0.1:8080/prefill-ws"
+const DEFAULT_UPDATE_INTERVAL_MS = 250
 
 type PrefillProgress = {
   sessionID: string
@@ -24,12 +26,10 @@ type PrefillProgress = {
 
 type MessageTiming = {
   sessionID: string
-  userMessageID?: string
   requestStartAt: number
   firstResponseAt?: number
   firstTokenAt?: number
   lastTokenAt?: number
-  lastToolCallAt?: number
 }
 
 type SessionAverage = {
@@ -44,17 +44,16 @@ type TrackerState = {
   messageTimingByID: Record<string, MessageTiming>
   sessionAverageByID: Record<string, SessionAverage>
   prefillBySession: Record<string, PrefillProgress>
-  pendingUserMessagesBySession: Record<string, string[]>
 }
 
-type ProxyPrefillPayload = {
-  found?: unknown
-  started?: unknown
+type WsPrefillMessage = {
+  session_id?: unknown
   total?: unknown
   cache?: unknown
   processed?: unknown
   time_ms?: unknown
   done?: unknown
+  started?: unknown
 }
 
 function estimateStreamTokens(delta: string) {
@@ -92,35 +91,28 @@ function activeDurationMs(samples: StreamSample[], tailAt?: number) {
   return Math.max(duration, SINGLE_SAMPLE_MS)
 }
 
-function parseProxyPrefill(value: unknown): { total: number; cache: number; processed: number; timeMs: number; done: boolean; started: boolean } | undefined {
+function parseWsMessage(value: unknown): { sessionID: string; done: boolean; started: boolean; total: number; cache: number; processed: number; timeMs: number } | undefined {
   if (!value || typeof value !== "object") return undefined
-  const data = value as ProxyPrefillPayload
+  const data = value as WsPrefillMessage
 
-  if (data.found !== true) return undefined
+  const sessionID = typeof data.session_id === "string" && data.session_id.length > 0 ? data.session_id : undefined
+  if (!sessionID) return undefined
+
+  const done = data.done === true
+  const started = data.started !== false
+
+  if (done) return { sessionID, done: true, started, total: 0, cache: 0, processed: 0, timeMs: 0 }
+
   if (
-    !Number.isFinite(data.total)
-    || !Number.isFinite(data.cache)
-    || !Number.isFinite(data.processed)
-    || !Number.isFinite(data.time_ms)
-    || typeof data.total !== "number"
-    || typeof data.cache !== "number"
-    || typeof data.processed !== "number"
-    || typeof data.time_ms !== "number"
-  ) {
-    return undefined
-  }
+    typeof data.total !== "number" || !Number.isFinite(data.total)
+    || typeof data.cache !== "number" || !Number.isFinite(data.cache)
+    || typeof data.processed !== "number" || !Number.isFinite(data.processed)
+    || typeof data.time_ms !== "number" || !Number.isFinite(data.time_ms)
+  ) return undefined
 
   if (data.total <= 0 || data.cache < 0 || data.processed < 0 || data.time_ms < 0) return undefined
-  if (data.processed > data.total && data.done !== true) return undefined
 
-  return {
-    total: data.total,
-    cache: data.cache,
-    processed: data.processed,
-    timeMs: data.time_ms,
-    done: data.done === true,
-    started: data.started !== false,
-  }
+  return { sessionID, done: false, started, total: data.total, cache: data.cache, processed: data.processed, timeMs: data.time_ms }
 }
 
 function formatPrefillEta(prefill: PrefillProgress): string {
@@ -196,31 +188,51 @@ function SessionPromptRight(props: {
 }
 
 const tui: TuiPlugin = async (api, options) => {
-  const pluginInitTime = Date.now()
-  const prefillProgressUrl = (typeof options?.prefillProgressUrl === "string"
-    ? options.prefillProgressUrl
-    : DEFAULT_PREFILL_PROGRESS_URL) + "/prefill-progress"
-  const prefillPollMs = (() => {
-    const n = Number(options?.prefillPollMs)
-    return Number.isFinite(n) && n > 0 ? Math.max(100, n) : DEFAULT_PREFILL_POLL_MS
+  const log = (() => {
+    const opt = options?.["tuiDebug"]
+    if (!opt) return undefined
+    const path = resolve(typeof opt === "string" && opt.length > 0 ? opt : "opencode-model-stats-tui.log")
+    const write = (line: string) => appendFileSync(path, line + "\n", "utf8")
+    write(`\n=== opencode-model-stats/tui started ${new Date().toISOString()} ===`)
+    console.log(`[opencode-model-stats/tui] debug log: ${path}`)
+    return (...args: unknown[]) => {
+      const ts = new Date().toISOString()
+      write(`${ts} ${args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ")}`)
+    }
   })()
+
+  const prefillWsUrl = typeof options?.prefillWsUrl === "string" && options.prefillWsUrl.length > 0
+    ? options.prefillWsUrl
+    : DEFAULT_PREFILL_WS_URL
+  const updateIntervalMs = (() => {
+    const n = Number(options?.prefillPollMs)
+    return Number.isFinite(n) && n > 0 ? Math.max(100, n) : DEFAULT_UPDATE_INTERVAL_MS
+  })()
+
+  log?.("tui plugin initialized, wsUrl=" + prefillWsUrl)
+
   const tracker: TrackerState = {
     streamSamplesBySession: {},
     messageTimingByID: {},
     sessionAverageByID: {},
     prefillBySession: {},
-    pendingUserMessagesBySession: {},
   }
   const [version, setVersion] = createSignal(0)
   const [clock, setClock] = createSignal(Date.now())
-  let prefillPollInFlight = false
-  let loggedPrefillPollFailure = false
 
-  const bump = () => setVersion((value) => value + 1)
+  const bump = () => setVersion((v) => v + 1)
 
   const clearPrefillProgress = (sessionID: string) => {
     if (!tracker.prefillBySession[sessionID]) return
     delete tracker.prefillBySession[sessionID]
+    bump()
+  }
+
+  const clearAllPrefill = () => {
+    if (Object.keys(tracker.prefillBySession).length === 0) return
+    for (const sessionID of Object.keys(tracker.prefillBySession)) {
+      delete tracker.prefillBySession[sessionID]
+    }
     bump()
   }
 
@@ -234,9 +246,10 @@ const tui: TuiPlugin = async (api, options) => {
       }
     }
 
-    for (const sessionID of Object.keys(tracker.pendingUserMessagesBySession)) {
-      if (api.state.session.status(sessionID)?.type === "idle") {
-        delete tracker.pendingUserMessagesBySession[sessionID]
+    for (const [messageID, timing] of Object.entries(tracker.messageTimingByID)) {
+      if (api.state.session.status(timing.sessionID)?.type === "idle") {
+        delete tracker.messageTimingByID[messageID]
+        changed = true
       }
     }
 
@@ -267,146 +280,70 @@ const tui: TuiPlugin = async (api, options) => {
     bump()
   }
 
-  const activeSessionMessages = () => {
-    const result: Record<string, { messageID: string; timing: MessageTiming }> = {}
+  // WebSocket connection to the proxy's prefill push stream
+  let ws: WebSocket | null = null
+  let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let wsDisposed = false
 
-    for (const [messageID, timing] of Object.entries(tracker.messageTimingByID)) {
-      if (timing.firstTokenAt) continue
-      const existing = result[timing.sessionID]
-      if (!existing || timing.requestStartAt > existing.timing.requestStartAt) {
-        result[timing.sessionID] = { messageID, timing }
-      }
-    }
-
-    return result
+  const scheduleReconnect = () => {
+    if (wsDisposed || wsReconnectTimer) return
+    wsReconnectTimer = setTimeout(() => {
+      wsReconnectTimer = null
+      connectWs()
+    }, 2_000)
   }
 
-  const getPrefillUrlForSession = (sessionID: string): string => {
-    const messages = api.state.session.messages(sessionID)
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]
-      if (msg.role !== "user") continue
-      const provider = api.state.provider.find((p) => p.id === msg.model.providerID)
-      const model = provider?.models[msg.model.modelID]
-      if (model?.api.url) {
-        try {
-          return new URL("/prefill-progress", model.api.url).toString()
-        } catch {}
-      }
-      break
-    }
-    return prefillProgressUrl
-  }
-
-  const pollPrefillProgress = async () => {
-    if (prefillPollInFlight) return
-    prefillPollInFlight = true
-
+  const connectWs = () => {
+    if (wsDisposed) return
+    log?.("ws: connecting")
     try {
-      const active = activeSessionMessages()
-      const activeSessionIDs = new Set(Object.keys(active))
+      ws = new WebSocket(prefillWsUrl)
+    } catch (err) {
+      log?.("ws: failed to construct WebSocket:", err)
+      scheduleReconnect()
+      return
+    }
 
-      for (const sessionID of Object.keys(tracker.prefillBySession)) {
-        const hasPending = (tracker.pendingUserMessagesBySession[sessionID]?.length ?? 0) > 0
-        if (api.state.session.status(sessionID)?.type === "idle" || (!activeSessionIDs.has(sessionID) && !hasPending)) {
-          setPrefillProgress(sessionID, undefined)
+    ws.onopen = () => {
+      log?.("ws: connected")
+    }
+
+    ws.onmessage = (evt) => {
+      try {
+        const raw = typeof evt.data === "string" ? evt.data : String(evt.data)
+        const msg = parseWsMessage(JSON.parse(raw) as unknown)
+        if (!msg) return
+        log?.("ws: message", msg)
+        if (msg.done || !msg.started) {
+          clearPrefillProgress(msg.sessionID)
+        } else {
+          setPrefillProgress(msg.sessionID, {
+            sessionID: msg.sessionID,
+            total: msg.total,
+            cache: msg.cache,
+            processed: msg.processed,
+            timeMs: msg.timeMs,
+            receivedAt: Date.now(),
+          })
         }
+      } catch (err) {
+        log?.("ws: message parse error:", err)
       }
+    }
 
-      for (const [sessionID, current] of Object.entries(active)) {
-        if (api.state.session.status(sessionID)?.type === "idle") {
-          setPrefillProgress(sessionID, undefined)
-          continue
-        }
+    ws.onclose = (evt) => {
+      log?.(`ws: closed (code=${evt.code})`)
+      ws = null
+      clearAllPrefill()
+      scheduleReconnect()
+    }
 
-        const url = new URL(getPrefillUrlForSession(sessionID))
-        url.searchParams.set("session_id", sessionID)
-        url.searchParams.set("message_id", current.timing.userMessageID ?? current.messageID)
-
-        const response = await fetch(url)
-        if (!response.ok) continue
-
-        const payload = parseProxyPrefill((await response.json()) as unknown)
-        if (!payload || payload.done || !payload.started) {
-          setPrefillProgress(sessionID, undefined)
-          continue
-        }
-
-        setPrefillProgress(sessionID, {
-          sessionID,
-          total: payload.total,
-          cache: payload.cache,
-          processed: payload.processed,
-          timeMs: payload.timeMs,
-          receivedAt: Date.now(),
-        })
-      }
-
-      // Poll every queued user message every cycle (unordered set).
-      // Entries are only removed when the assistant turn completes or the session goes idle.
-      // done=true is silently skipped for display (proxy may reset the key on the next tool roundtrip).
-      for (const [sessionID, queue] of Object.entries(tracker.pendingUserMessagesBySession)) {
-        if (activeSessionIDs.has(sessionID)) continue
-        if (api.state.session.status(sessionID)?.type === "idle") continue
-        if (queue.length === 0) continue
-
-        const baseUrl = getPrefillUrlForSession(sessionID)
-
-        const results = await Promise.all(
-          queue.map(async (msgID) => {
-            try {
-              const u = new URL(baseUrl)
-              u.searchParams.set("session_id", sessionID)
-              u.searchParams.set("message_id", msgID)
-              const r = await fetch(u)
-              if (!r.ok) return { msgID, payload: undefined }
-              return { msgID, payload: parseProxyPrefill((await r.json()) as unknown) }
-            } catch {
-              return { msgID, payload: undefined }
-            }
-          }),
-        )
-
-        const reporting = results
-          .map((r) => r.payload)
-          .filter((p): p is NonNullable<ReturnType<typeof parseProxyPrefill>> =>
-            p !== undefined && !p.done && p.started)
-
-        if (reporting.length === 0) {
-          setPrefillProgress(sessionID, undefined)
-          continue
-        }
-
-        const combined = reporting.reduce(
-          (acc, p) => ({
-            total: acc.total + p.total,
-            cache: acc.cache + p.cache,
-            processed: acc.processed + p.processed,
-            timeMs: acc.timeMs + p.timeMs,
-          }),
-          { total: 0, cache: 0, processed: 0, timeMs: 0 },
-        )
-
-        setPrefillProgress(sessionID, {
-          sessionID,
-          total: combined.total,
-          cache: combined.cache,
-          processed: combined.processed,
-          timeMs: combined.timeMs,
-          receivedAt: Date.now(),
-        })
-      }
-
-      loggedPrefillPollFailure = false
-    } catch {
-      if (!loggedPrefillPollFailure) {
-        console.warn("opencode-model-stats: prefill progress polling failed; using elapsed prefill fallback.")
-        loggedPrefillPollFailure = true
-      }
-    } finally {
-      prefillPollInFlight = false
+    ws.onerror = () => {
+      log?.("ws: error (close will follow)")
     }
   }
+
+  connectWs()
 
   const pruneSamples = (now = Date.now()) => {
     let changed = false
@@ -463,27 +400,17 @@ const tui: TuiPlugin = async (api, options) => {
   })
 
   const onMessage = api.event.on("message.updated", (evt) => {
-    if (evt.properties.info.role === "user") {
-      if (evt.properties.info.time.created < pluginInitTime) return
-      const queue = tracker.pendingUserMessagesBySession[evt.properties.sessionID] ??= []
-      if (!queue.includes(evt.properties.info.id)) queue.push(evt.properties.info.id)
-      return
-    }
-
     if (evt.properties.info.role !== "assistant") return
 
     if (!evt.properties.info.time.completed) {
       const existing = tracker.messageTimingByID[evt.properties.info.id]
-      const userMessageID = existing?.userMessageID
-        ?? tracker.pendingUserMessagesBySession[evt.properties.sessionID]?.shift()
+      log?.(`onMessage assistant incomplete: msgID=${evt.properties.info.id} existing=${!!existing}`)
       tracker.messageTimingByID[evt.properties.info.id] = {
         sessionID: evt.properties.sessionID,
-        userMessageID,
         requestStartAt: evt.properties.info.time.created,
         firstResponseAt: existing?.firstResponseAt,
         firstTokenAt: existing?.firstTokenAt,
         lastTokenAt: existing?.lastTokenAt,
-        lastToolCallAt: existing?.lastToolCallAt,
       }
       bump()
       return
@@ -513,16 +440,6 @@ const tui: TuiPlugin = async (api, options) => {
         }
       }
     }
-    if (timing?.userMessageID) {
-      const pendingQueue = tracker.pendingUserMessagesBySession[evt.properties.sessionID]
-      if (pendingQueue) {
-        const idx = pendingQueue.indexOf(timing.userMessageID)
-        if (idx !== -1) {
-          pendingQueue.splice(idx, 1)
-          if (pendingQueue.length === 0) delete tracker.pendingUserMessagesBySession[evt.properties.sessionID]
-        }
-      }
-    }
     delete tracker.messageTimingByID[evt.properties.info.id]
     pruneSamples(evt.properties.info.time.completed)
     bump()
@@ -545,38 +462,27 @@ const tui: TuiPlugin = async (api, options) => {
         firstResponseAt: timing.firstResponseAt ?? evt.properties.time,
       }
       bump()
-      return
     }
-    if (
-      evt.properties.part.state.status === "completed" ||
-      evt.properties.part.state.status === "error"
-    ) {
-      if (timing.userMessageID) {
-        const queue = tracker.pendingUserMessagesBySession[timing.sessionID] ??= []
-        if (!queue.includes(timing.userMessageID)) queue.push(timing.userMessageID)
-      }
-      return
-    }
-    if (evt.properties.part.state.status !== "running") return
-    tracker.messageTimingByID[evt.properties.part.messageID] = {
-      ...timing,
-      lastToolCallAt: evt.properties.part.state.time.start,
-    }
-    bump()
   })
 
   const timer = setInterval(() => {
     setClock(Date.now())
     pruneSamples()
     prunePrefill()
-    void pollPrefillProgress()
-  }, prefillPollMs)
+  }, updateIntervalMs)
 
   api.lifecycle.onDispose(() => {
     onDelta()
     onMessage()
     onPart()
     clearInterval(timer)
+    wsDisposed = true
+    if (wsReconnectTimer) {
+      clearTimeout(wsReconnectTimer)
+      wsReconnectTimer = null
+    }
+    ws?.close()
+    ws = null
   })
 
   api.slots.register({
