@@ -13,7 +13,7 @@ Install from the CLI:
 opencode plugin opencode-model-stats@latest --global
 ```
 
-Requires `opencode` `1.4` or newer.
+Requires `opencode` `1.14.31` or newer.
 
 ## Configuration
 

@@ -51,13 +51,39 @@ type TrackerState = {
 
 type WsPrefillMessage = {
   session_id?: unknown
+  sessionID?: unknown
   message_id?: unknown
+  messageID?: unknown
   total?: unknown
   cache?: unknown
   processed?: unknown
   time_ms?: unknown
+  timeMs?: unknown
   done?: unknown
   started?: unknown
+}
+
+function readString(value: unknown): string | undefined {
+  if (typeof value === "string" && value.length > 0) return value
+  return undefined
+}
+
+function readNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string" && value.length > 0) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+function readBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value
+  if (typeof value === "string") {
+    if (value === "true") return true
+    if (value === "false") return false
+  }
+  return undefined
 }
 
 function estimateStreamTokens(delta: string) {
@@ -99,25 +125,30 @@ function parseWsMessage(value: unknown): { sessionID: string; messageID: string;
   if (!value || typeof value !== "object") return undefined
   const data = value as WsPrefillMessage
 
-  const sessionID = typeof data.session_id === "string" && data.session_id.length > 0 ? data.session_id : undefined
+  const sessionID = readString(data.session_id) ?? readString(data.sessionID)
   if (!sessionID) return undefined
 
-  const messageID = typeof data.message_id === "string" ? data.message_id : ""
-  const done = data.done === true
-  const started = data.started !== false
+  const messageID = readString(data.message_id) ?? readString(data.messageID) ?? ""
+  const done = readBoolean(data.done) === true
+  const started = readBoolean(data.started) !== false
 
   if (done) return { sessionID, messageID, done: true, started, total: 0, cache: 0, processed: 0, timeMs: 0 }
 
+  const total = readNumber(data.total)
+  const cache = readNumber(data.cache)
+  const processed = readNumber(data.processed)
+  const timeMs = readNumber(data.time_ms) ?? readNumber(data.timeMs)
+
   if (
-    typeof data.total !== "number" || !Number.isFinite(data.total)
-    || typeof data.cache !== "number" || !Number.isFinite(data.cache)
-    || typeof data.processed !== "number" || !Number.isFinite(data.processed)
-    || typeof data.time_ms !== "number" || !Number.isFinite(data.time_ms)
+    total === undefined
+    || cache === undefined
+    || processed === undefined
+    || timeMs === undefined
   ) return undefined
 
-  if (data.total <= 0 || data.cache < 0 || data.processed < 0 || data.time_ms < 0) return undefined
+  if (total <= 0 || cache < 0 || processed < 0 || timeMs < 0) return undefined
 
-  return { sessionID, messageID, done: false, started, total: data.total, cache: data.cache, processed: data.processed, timeMs: data.time_ms }
+  return { sessionID, messageID, done: false, started, total, cache, processed, timeMs }
 }
 
 function formatPrefillEta(prefill: PrefillProgress, last: PrefillProgress | undefined): string {
@@ -388,9 +419,18 @@ const tui: TuiPlugin = async (api, options) => {
       try {
         const raw = typeof evt.data === "string" ? evt.data : String(evt.data)
         log?.("ws: raw message:", raw)
-        const msg = parseWsMessage(JSON.parse(raw) as unknown)
+        const parsed = JSON.parse(raw) as unknown
+        const msg = parseWsMessage(parsed)
         if (!msg) {
-          log?.("ws: message rejected by parser (unexpected shape)")
+          // Log the actual keys present so shape mismatches are immediately visible.
+          if (parsed && typeof parsed === "object") {
+            const keys = Object.keys(parsed as object)
+            const sample: Record<string, unknown> = {}
+            for (const k of keys) sample[k] = typeof (parsed as Record<string, unknown>)[k]
+            clog("ws: message rejected by parser — keys and value types:", JSON.stringify(sample))
+          } else {
+            clog("ws: message rejected by parser — not an object, typeof:", typeof parsed)
+          }
           return
         }
         log?.("ws: parsed:", msg)

@@ -18,6 +18,21 @@ function onRequest(callback: OnRequestCallback): () => void {
 
 export const llm = { onRequest } as const
 
+function readMessageID(input: { message?: { id?: unknown } }): string {
+  const raw = input?.message?.id
+  return typeof raw === "string" ? raw : ""
+}
+
+function readModelID(input: {
+  model?: { id?: unknown }
+  message?: { model?: { modelID?: unknown } }
+}): string {
+  const direct = input?.model?.id
+  if (typeof direct === "string" && direct.length > 0) return direct
+  const nested = input?.message?.model?.modelID
+  return typeof nested === "string" ? nested : ""
+}
+
 const server: Plugin = async (_input, options) => {
   const debug = options?.["debug"] === true
 
@@ -29,15 +44,22 @@ const server: Plugin = async (_input, options) => {
     "chat.headers": async (input, output) => {
       const ctx: LlmRequestContext = {
         sessionID: input.sessionID,
-        messageID: input.message.id,
+        messageID: readMessageID(input),
         providerID: input.model.providerID,
-        modelID: input.model.id,
+        modelID: readModelID(input),
       }
 
       if (debug) log("chat.headers: injecting base headers for", ctx)
 
+      // Emit both legacy and current correlation header names for compatibility
+      // with proxy stacks that normalize or expect one naming style.
       output.headers["x-opencode-session-id"] = ctx.sessionID
-      output.headers["x-opencode-message-id"] = ctx.messageID
+      output.headers["session_id"] = ctx.sessionID
+
+      if (ctx.messageID) {
+        output.headers["x-opencode-message-id"] = ctx.messageID
+        output.headers["message_id"] = ctx.messageID
+      }
 
       if (callbacks.size === 0) {
         if (debug) log("chat.headers: no onRequest callbacks registered")
