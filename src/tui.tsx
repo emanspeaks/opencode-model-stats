@@ -51,13 +51,39 @@ type TrackerState = {
 
 type WsPrefillMessage = {
   session_id?: unknown
+  sessionID?: unknown
   message_id?: unknown
+  messageID?: unknown
   total?: unknown
   cache?: unknown
   processed?: unknown
   time_ms?: unknown
+  timeMs?: unknown
   done?: unknown
   started?: unknown
+}
+
+function readString(value: unknown): string | undefined {
+  if (typeof value === "string" && value.length > 0) return value
+  return undefined
+}
+
+function readNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string" && value.length > 0) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+function readBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value
+  if (typeof value === "string") {
+    if (value === "true") return true
+    if (value === "false") return false
+  }
+  return undefined
 }
 
 function estimateStreamTokens(delta: string) {
@@ -99,25 +125,30 @@ function parseWsMessage(value: unknown): { sessionID: string; messageID: string;
   if (!value || typeof value !== "object") return undefined
   const data = value as WsPrefillMessage
 
-  const sessionID = typeof data.session_id === "string" && data.session_id.length > 0 ? data.session_id : undefined
+  const sessionID = readString(data.session_id) ?? readString(data.sessionID)
   if (!sessionID) return undefined
 
-  const messageID = typeof data.message_id === "string" ? data.message_id : ""
-  const done = data.done === true
-  const started = data.started !== false
+  const messageID = readString(data.message_id) ?? readString(data.messageID) ?? ""
+  const done = readBoolean(data.done) === true
+  const started = readBoolean(data.started) !== false
 
   if (done) return { sessionID, messageID, done: true, started, total: 0, cache: 0, processed: 0, timeMs: 0 }
 
+  const total = readNumber(data.total)
+  const cache = readNumber(data.cache)
+  const processed = readNumber(data.processed)
+  const timeMs = readNumber(data.time_ms) ?? readNumber(data.timeMs)
+
   if (
-    typeof data.total !== "number" || !Number.isFinite(data.total)
-    || typeof data.cache !== "number" || !Number.isFinite(data.cache)
-    || typeof data.processed !== "number" || !Number.isFinite(data.processed)
-    || typeof data.time_ms !== "number" || !Number.isFinite(data.time_ms)
+    total === undefined
+    || cache === undefined
+    || processed === undefined
+    || timeMs === undefined
   ) return undefined
 
-  if (data.total <= 0 || data.cache < 0 || data.processed < 0 || data.time_ms < 0) return undefined
+  if (total <= 0 || cache < 0 || processed < 0 || timeMs < 0) return undefined
 
-  return { sessionID, messageID, done: false, started, total: data.total, cache: data.cache, processed: data.processed, timeMs: data.time_ms }
+  return { sessionID, messageID, done: false, started, total, cache, processed, timeMs }
 }
 
 function formatPrefillEta(prefill: PrefillProgress, last: PrefillProgress | undefined): string {
@@ -314,31 +345,152 @@ const tui: TuiPlugin = async (api, options) => {
     bump()
   }
 
-  // Per-session current model WS URL, updated on each user message
+  // Per-session current model WS URL.
   const currentWsUrlBySession: Record<string, string> = {}
   // Active WebSocket instances keyed by URL
   const wsByUrl = new Map<string, WebSocket>()
   // Pending reconnect timers keyed by URL
   const wsReconnectsByUrl = new Map<string, ReturnType<typeof setTimeout>>()
+  // Prevent repetitive shape dumps when derivation fails repeatedly in the same session.
+  const wsDerivationShapeLogged = new Set<string>()
   let wsDisposed = false
 
-  const deriveWsUrl = (sessionID: string): string | null => {
+  const asRecord = (value: unknown): Record<string, unknown> | undefined => {
+    if (!value || typeof value !== "object") return undefined
+    return value as Record<string, unknown>
+  }
+
+  const readApiCandidate = (value: unknown): string | undefined => {
+    const obj = asRecord(value)
+    if (!obj) return undefined
+    return readString(obj.url)
+      ?? readString(obj.baseUrl)
+      ?? readString(obj.baseURL)
+      ?? readString(obj.apiUrl)
+      ?? readString(obj.apiURL)
+      ?? readString(obj.endpoint)
+  }
+
+  const toPrefillWsUrl = (raw: string): string | undefined => {
+    try {
+      const u = new URL(raw)
+      const wsScheme = u.protocol === "https:" ? "wss:" : u.protocol === "http:" ? "ws:" : u.protocol
+      if (wsScheme !== "ws:" && wsScheme !== "wss:") return undefined
+      return `${wsScheme}//${u.host}/prefill-ws`
+    } catch {
+      return undefined
+    }
+  }
+
+  const pickApiUrl = (model: unknown, provider: unknown): string | undefined => {
+    const modelObj = asRecord(model)
+    const providerObj = asRecord(provider)
+    // provider.options.baseURL is where custom/local providers store the URL in newer opencode versions
+    const providerOptions = asRecord(providerObj?.options)
+    return readApiCandidate(modelObj?.api)
+      ?? readApiCandidate(providerObj?.api)
+      ?? readString(modelObj?.url)
+      ?? readString(modelObj?.baseUrl)
+      ?? readString(modelObj?.baseURL)
+      ?? readString(modelObj?.apiUrl)
+      ?? readString(modelObj?.apiURL)
+      ?? readString(modelObj?.endpoint)
+      ?? readString(providerObj?.url)
+      ?? readString(providerObj?.baseUrl)
+      ?? readString(providerObj?.baseURL)
+      ?? readString(providerObj?.apiUrl)
+      ?? readString(providerObj?.apiURL)
+      ?? readString(providerObj?.endpoint)
+      ?? readString(providerOptions?.baseURL)
+      ?? readString(providerOptions?.baseUrl)
+      ?? readString(providerOptions?.url)
+      ?? readString(providerOptions?.apiUrl)
+      ?? readString(providerOptions?.endpoint)
+  }
+
+  const readModelRef = (msg: unknown): { providerID: string; modelID: string } | undefined => {
+    if (!msg || typeof msg !== "object") return undefined
+    const data = msg as {
+      // legacy: model ref directly on message
+      model?: {
+        providerID?: unknown
+        providerId?: unknown
+        provider?: { id?: unknown }
+        modelID?: unknown
+        modelId?: unknown
+        id?: unknown
+      }
+      // current SDK v2: model ref under metadata.assistant
+      metadata?: {
+        assistant?: {
+          providerID?: unknown
+          providerId?: unknown
+          modelID?: unknown
+          modelId?: unknown
+        }
+      }
+    }
+
+    const assistant = data.metadata?.assistant
+    const providerID = readString(data.model?.providerID)
+      ?? readString(data.model?.providerId)
+      ?? readString(data.model?.provider?.id)
+      ?? readString(assistant?.providerID)
+      ?? readString(assistant?.providerId)
+    const modelID = readString(data.model?.modelID)
+      ?? readString(data.model?.modelId)
+      ?? readString(data.model?.id)
+      ?? readString(assistant?.modelID)
+      ?? readString(assistant?.modelId)
+
+    if (!providerID || !modelID) return undefined
+    return { providerID, modelID }
+  }
+
+  const deriveWsUrl = (sessionID: string): { url: string | null; reason: string } => {
     const messages = api.state.session.messages(sessionID)
+    if (messages.length === 0) {
+      return { url: null, reason: "no session messages" }
+    }
+
+    let sawModelRef = false
+    let unresolvedProviderOrModel = 0
+    let missingApiUrl = 0
+    let invalidApiUrl = 0
+
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i]
-      if (msg.role !== "user") continue
-      const provider = api.state.provider.find((p) => p.id === msg.model.providerID)
-      const model = provider?.models[msg.model.modelID]
-      if (model?.api.url) {
-        try {
-          const apiUrl = new URL(model.api.url)
-          const wsScheme = apiUrl.protocol === "https:" ? "wss:" : "ws:"
-          return `${wsScheme}//${apiUrl.host}/prefill-ws`
-        } catch {}
+      const modelRef = readModelRef(msg)
+      if (!modelRef) continue
+      sawModelRef = true
+
+      const provider = api.state.provider.find((p) => p.id === modelRef.providerID)
+      const model = provider?.models[modelRef.modelID]
+      if (!provider || !model) {
+        unresolvedProviderOrModel++
+        continue
       }
-      break
+
+      const apiUrl = pickApiUrl(model, provider)
+      if (!apiUrl) {
+        missingApiUrl++
+        continue
+      }
+
+      const wsUrl = toPrefillWsUrl(apiUrl)
+      if (!wsUrl) {
+        invalidApiUrl++
+        continue
+      }
+
+      return { url: wsUrl, reason: "ok" }
     }
-    return null
+
+    if (!sawModelRef) return { url: null, reason: "no message model refs found" }
+    if (unresolvedProviderOrModel > 0) return { url: null, reason: `provider/model unresolved for ${unresolvedProviderOrModel} message(s)` }
+    if (missingApiUrl > 0) return { url: null, reason: `model.api.url missing for ${missingApiUrl} message(s)` }
+    if (invalidApiUrl > 0) return { url: null, reason: `invalid model.api.url for ${invalidApiUrl} message(s)` }
+    return { url: null, reason: "unknown derivation failure" }
   }
 
   const isUrlWanted = (url: string): boolean => {
@@ -368,7 +520,14 @@ const tui: TuiPlugin = async (api, options) => {
   }
 
   const openWs = (url: string) => {
-    if (wsDisposed || wsByUrl.has(url)) return
+    if (wsDisposed) {
+      log?.("ws: skipped connect (disposed): " + url)
+      return
+    }
+    if (wsByUrl.has(url)) {
+      log?.("ws: skipped connect (already open): " + url)
+      return
+    }
     log?.("ws: connecting to " + url)
     let socket: WebSocket
     try {
@@ -388,9 +547,18 @@ const tui: TuiPlugin = async (api, options) => {
       try {
         const raw = typeof evt.data === "string" ? evt.data : String(evt.data)
         log?.("ws: raw message:", raw)
-        const msg = parseWsMessage(JSON.parse(raw) as unknown)
+        const parsed = JSON.parse(raw) as unknown
+        const msg = parseWsMessage(parsed)
         if (!msg) {
-          log?.("ws: message rejected by parser (unexpected shape)")
+          // Log the actual keys present so shape mismatches are immediately visible.
+          if (parsed && typeof parsed === "object") {
+            const keys = Object.keys(parsed as object)
+            const sample: Record<string, unknown> = {}
+            for (const k of keys) sample[k] = typeof (parsed as Record<string, unknown>)[k]
+            clog("ws: message rejected by parser — keys and value types:", JSON.stringify(sample))
+          } else {
+            clog("ws: message rejected by parser — not an object, typeof:", typeof parsed)
+          }
           return
         }
         log?.("ws: parsed:", msg)
@@ -417,10 +585,10 @@ const tui: TuiPlugin = async (api, options) => {
       if (wsByUrl.get(url) === socket) wsByUrl.delete(url)
       clearPrefillForUrl(url)
       if (isUrlWanted(url)) {
-        clog(`ws: closed (code=${evt.code}), reconnecting in 2s:`, url)
+        clog(`ws: closed (code=${evt.code}, clean=${evt.wasClean}, reason=${evt.reason || ""}), reconnecting in 2s:`, url)
         scheduleReconnect(url)
       } else {
-        clog(`ws: closed (code=${evt.code}):`, url)
+        clog(`ws: closed (code=${evt.code}, clean=${evt.wasClean}, reason=${evt.reason || ""}):`, url)
       }
     }
 
@@ -434,12 +602,47 @@ const tui: TuiPlugin = async (api, options) => {
     openWs(url)
   }
 
+  const ensureSessionWs = (sessionID: string) => {
+    const derived = configWsUrl
+      ? { url: configWsUrl, reason: "config override" }
+      : deriveWsUrl(sessionID)
+    const url = derived.url
+    if (!url) {
+      log?.(`ws: no derived url for session ${sessionID} (${derived.reason})`)
+      if (!wsDerivationShapeLogged.has(sessionID)) {
+        wsDerivationShapeLogged.add(sessionID)
+        const messages = api.state.session.messages(sessionID)
+        const recent = messages.slice(-3)
+        const shapes = recent.map((msg) => {
+          const data = asRecord(msg)
+          const model = asRecord(data?.model)
+          const api = asRecord(model?.api)
+          return {
+            role: readString(data?.role) ?? "",
+            modelKeys: model ? Object.keys(model) : [],
+            apiKeys: api ? Object.keys(api) : [],
+          }
+        })
+        log?.("ws: derivation shape sample", { sessionID, messageCount: messages.length, recentShapes: shapes })
+      }
+      return
+    }
+
+    const oldUrl = currentWsUrlBySession[sessionID]
+    currentWsUrlBySession[sessionID] = url
+    ensureWsConnected(url)
+    if (oldUrl && oldUrl !== url) closeWsIfUnwanted(oldUrl)
+  }
+
   const closeWsIfUnwanted = (url: string) => {
     if (isUrlWanted(url)) return
     const timer = wsReconnectsByUrl.get(url)
     if (timer) { clearTimeout(timer); wsReconnectsByUrl.delete(url) }
     const socket = wsByUrl.get(url)
-    if (socket) { socket.close() }  // onclose handles wsByUrl.delete and clearPrefillForUrl
+    if (socket) {
+      log?.("ws: closing unwanted socket: " + url)
+      socket.close()
+    }  // onclose handles wsByUrl.delete and clearPrefillForUrl
   }
 
   if (configWsUrl) openWs(configWsUrl)
@@ -500,13 +703,7 @@ const tui: TuiPlugin = async (api, options) => {
 
   const onMessage = api.event.on("message.updated", (evt) => {
     if (evt.properties.info.role === "user") {
-      const url = configWsUrl ?? deriveWsUrl(evt.properties.sessionID)
-      if (url) {
-        const oldUrl = currentWsUrlBySession[evt.properties.sessionID]
-        currentWsUrlBySession[evt.properties.sessionID] = url
-        ensureWsConnected(url)
-        if (oldUrl && oldUrl !== url) closeWsIfUnwanted(oldUrl)
-      }
+      ensureSessionWs(evt.properties.sessionID)
       return
     }
 
@@ -515,6 +712,9 @@ const tui: TuiPlugin = async (api, options) => {
     if (!evt.properties.info.time.completed) {
       const existing = tracker.messageTimingByID[evt.properties.info.id]
       log?.(`onMessage assistant incomplete: msgID=${evt.properties.info.id} existing=${!!existing}`)
+      // TUI may attach in the middle of generation without a fresh user update event.
+      // Ensure prefill websocket is connected for this session in that case.
+      ensureSessionWs(evt.properties.sessionID)
       tracker.messageTimingByID[evt.properties.info.id] = {
         sessionID: evt.properties.sessionID,
         requestStartAt: evt.properties.info.time.created,
@@ -582,6 +782,7 @@ const tui: TuiPlugin = async (api, options) => {
   }, updateIntervalMs)
 
   api.lifecycle.onDispose(() => {
+    log?.(`ws: disposing plugin; reconnectTimers=${wsReconnectsByUrl.size} openSockets=${wsByUrl.size}`)
     onDelta()
     onMessage()
     onPart()
@@ -589,7 +790,10 @@ const tui: TuiPlugin = async (api, options) => {
     wsDisposed = true
     for (const timer of wsReconnectsByUrl.values()) clearTimeout(timer)
     wsReconnectsByUrl.clear()
-    for (const socket of wsByUrl.values()) socket.close()
+    for (const [url, socket] of wsByUrl.entries()) {
+      log?.("ws: closing socket on dispose: " + url)
+      socket.close()
+    }
     wsByUrl.clear()
   })
 
